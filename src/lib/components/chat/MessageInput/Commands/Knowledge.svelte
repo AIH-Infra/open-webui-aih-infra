@@ -8,7 +8,11 @@
 
 	import { folders } from '$lib/stores';
 	import { getFolders } from '$lib/apis/folders';
-	import { searchKnowledgeBases, searchKnowledgeFiles } from '$lib/apis/knowledge';
+	import {
+		searchKnowledgeBases,
+		searchKnowledgeFiles,
+		searchKnowledgeFilesById
+	} from '$lib/apis/knowledge';
 	import { removeLastWordFromString, isValidHttpUrl, isYoutubeUrl, decodeString } from '$lib/utils';
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
@@ -25,6 +29,7 @@
 
 	let selectedIdx = 0;
 	let items = [];
+	let searchDebounceTimer: ReturnType<typeof setTimeout>;
 
 	export let filteredItems = [];
 	$: filteredItems = [
@@ -67,11 +72,51 @@
 	let knowledgeItems = [];
 	let fileItems = [];
 
+	const getAllKnowledgeFilesById = async (id: string) => {
+		const items: any[] = [];
+		let total = 0;
+		let page = 1;
+
+		while (true) {
+			const res = await searchKnowledgeFilesById(
+				localStorage.token,
+				id,
+				null,
+				null,
+				null,
+				null,
+				page
+			);
+
+			const pageItems = res?.items ?? [];
+			total = res?.total ?? items.length;
+			items.push(...pageItems);
+
+			if (pageItems.length === 0 || items.length >= total) {
+				break;
+			}
+
+			page += 1;
+		}
+
+		return {
+			items,
+			total
+		};
+	};
+
 	$: items = [...folderItems, ...knowledgeItems, ...fileItems];
 
-	$: if (query !== null) {
-		getItems();
+	$: if (query !== undefined) {
+		clearTimeout(searchDebounceTimer);
+		searchDebounceTimer = setTimeout(() => {
+			getItems();
+		}, 200);
 	}
+
+	onDestroy(() => {
+		clearTimeout(searchDebounceTimer);
+	});
 
 	const getItems = () => {
 		getFolderItems();
@@ -166,12 +211,42 @@
 					? ' bg-gray-50 dark:bg-gray-800 dark:text-gray-100 selected-command-option-button'
 					: ''}"
 				type="button"
-				on:click={() => {
+				on:click={async () => {
 					console.log(item);
-					onSelect({
-						type: 'knowledge',
-						data: item
-					});
+
+					if (item.type === 'collection') {
+						const filesRes = await getAllKnowledgeFilesById(
+							item.id
+						).catch(() => null);
+
+						if (filesRes) {
+							const files = filesRes.items.map(f => ({
+								...f,
+								enabled: true,
+								filename: f.name || f.filename
+							}));
+
+							onSelect({
+								type: 'knowledge',
+								data: {
+									...item,
+									files: files,
+									allFilesEnabled: true,
+									boost: 1.0
+								}
+							});
+						} else {
+							onSelect({
+								type: 'knowledge',
+								data: item
+							});
+						}
+					} else {
+						onSelect({
+							type: 'knowledge',
+							data: item
+						});
+					}
 				}}
 				on:mousemove={() => {
 					selectedIdx = idx;
