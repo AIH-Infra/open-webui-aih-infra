@@ -36,7 +36,6 @@ from open_webui.config import (
     DEFAULT_VOICE_MODE_PROMPT_TEMPLATE,
 )
 
-
 log = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -47,6 +46,21 @@ router = APIRouter()
 # Task Endpoints
 #
 ##################################
+
+
+class ActiveChatsForm(BaseModel):
+    chat_ids: list[str]
+
+
+@router.post("/active/chats")
+async def check_active_chats(
+    request: Request, form_data: ActiveChatsForm, user=Depends(get_verified_user)
+):
+    """Check which chat IDs have active tasks."""
+    from open_webui.tasks import get_active_chat_ids
+
+    active = await get_active_chat_ids(request.app.state.redis, form_data.chat_ids)
+    return {"active_chat_ids": active}
 
 
 @router.get("/config")
@@ -507,10 +521,28 @@ async def generate_queries(
         f"generating {type} queries using model {task_model_id} for user {user.email}"
     )
 
+    def clamp_query_generation_param(value, default: int) -> int:
+        try:
+            parsed_value = int(value)
+        except (TypeError, ValueError):
+            parsed_value = default
+
+        return min(max(parsed_value, 1), 10)
+
+    # AIH-Infra: Extract query generation params
+    query_count = clamp_query_generation_param(form_data.get("query_count"), 3)
+    context_range = clamp_query_generation_param(form_data.get("context_range"), 6)
+
+    log.info(f"Query generation params: query_count={query_count}, context_range={context_range}")
+
     if (request.app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE).strip() != "":
         template = request.app.state.config.QUERY_GENERATION_PROMPT_TEMPLATE
     else:
         template = DEFAULT_QUERY_GENERATION_PROMPT_TEMPLATE
+
+    # AIH-Infra: Replace query_count and context_range in template
+    template = template.replace("{{QUERY_COUNT}}", str(query_count))
+    template = template.replace("{{MESSAGES:END:6}}", f"{{{{MESSAGES:END:{context_range}}}}}")
 
     content = query_generation_template(template, form_data["messages"], user)
 

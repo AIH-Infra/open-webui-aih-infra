@@ -37,9 +37,10 @@ from langchain_text_splitters import (
 from langchain_core.documents import Document
 
 from open_webui.models.files import FileModel, FileUpdateForm, Files
+from open_webui.utils.access_control.files import has_access_to_file
 from open_webui.models.knowledge import Knowledges
 from open_webui.storage.provider import Storage
-from open_webui.internal.db import get_session
+from open_webui.internal.db import get_session, get_db
 from sqlalchemy.orm import Session
 
 
@@ -76,6 +77,8 @@ from open_webui.retrieval.web.perplexity import search_perplexity
 from open_webui.retrieval.web.sougou import search_sougou
 from open_webui.retrieval.web.firecrawl import search_firecrawl
 from open_webui.retrieval.web.external import search_external
+from open_webui.retrieval.web.yandex import search_yandex
+from open_webui.retrieval.web.ydc import search_youcom
 
 from open_webui.retrieval.utils import (
     get_content_from_url,
@@ -94,6 +97,15 @@ from open_webui.utils.misc import (
 )
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.access_control import has_permission
+from open_webui.utils.rag import (
+    normalize_reranking_preset_models,
+    resolve_effective_hybrid,
+    resolve_effective_reranking_model,
+)
+from open_webui.utils.pdf_page_tracker import (
+    extract_all_page_anchors,
+    get_chunk_page_metadata,
+)
 
 from open_webui.config import (
     ENV,
@@ -109,6 +121,7 @@ from open_webui.config import (
 from open_webui.env import (
     DEVICE_TYPE,
     DOCKER,
+    RAG_EMBEDDING_TIMEOUT,
     SENTENCE_TRANSFORMERS_BACKEND,
     SENTENCE_TRANSFORMERS_MODEL_KWARGS,
     SENTENCE_TRANSFORMERS_CROSS_ENCODER_BACKEND,
@@ -125,6 +138,35 @@ log = logging.getLogger(__name__)
 # Utility functions
 #
 ##########################################
+
+
+def build_request_reranking_function(
+    request: Request,
+    reranking_model: Optional[str],
+):
+    if request.app.state.config.RAG_RERANKING_ENGINE != "external":
+        return request.app.state.RERANKING_FUNCTION
+
+    if not reranking_model:
+        return request.app.state.RERANKING_FUNCTION
+
+    global_model = request.app.state.config.RAG_RERANKING_MODEL
+    if reranking_model == global_model:
+        return request.app.state.RERANKING_FUNCTION
+
+    rf = get_rf(
+        request.app.state.config.RAG_RERANKING_ENGINE,
+        reranking_model,
+        request.app.state.config.RAG_EXTERNAL_RERANKER_URL,
+        request.app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
+        request.app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
+    )
+
+    return get_reranking_function(
+        request.app.state.config.RAG_RERANKING_ENGINE,
+        reranking_model,
+        rf,
+    )
 
 
 def get_ef(
@@ -268,6 +310,7 @@ async def get_status(request: Request):
         "RAG_RERANKING_MODEL": request.app.state.config.RAG_RERANKING_MODEL,
         "RAG_EMBEDDING_BATCH_SIZE": request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
         "ENABLE_ASYNC_EMBEDDING": request.app.state.config.ENABLE_ASYNC_EMBEDDING,
+        "RAG_EMBEDDING_CONCURRENT_REQUESTS": request.app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
     }
 
 
@@ -279,6 +322,7 @@ async def get_embedding_config(request: Request, user=Depends(get_admin_user)):
         "RAG_EMBEDDING_MODEL": request.app.state.config.RAG_EMBEDDING_MODEL,
         "RAG_EMBEDDING_BATCH_SIZE": request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
         "ENABLE_ASYNC_EMBEDDING": request.app.state.config.ENABLE_ASYNC_EMBEDDING,
+        "RAG_EMBEDDING_CONCURRENT_REQUESTS": request.app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
         "openai_config": {
             "url": request.app.state.config.RAG_OPENAI_API_BASE_URL,
             "key": request.app.state.config.RAG_OPENAI_API_KEY,
@@ -319,6 +363,7 @@ class EmbeddingModelUpdateForm(BaseModel):
     RAG_EMBEDDING_MODEL: str
     RAG_EMBEDDING_BATCH_SIZE: Optional[int] = 1
     ENABLE_ASYNC_EMBEDDING: Optional[bool] = True
+    RAG_EMBEDDING_CONCURRENT_REQUESTS: Optional[int] = 0
 
 
 def unload_embedding_model(request: Request):
@@ -344,6 +389,11 @@ async def update_embedding_config(
         f"Updating embedding model: {request.app.state.config.RAG_EMBEDDING_MODEL} to {form_data.RAG_EMBEDDING_MODEL}"
     )
     unload_embedding_model(request)
+    if form_data.RAG_EMBEDDING_ENGINE == "":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Local SentenceTransformers embedding is disabled. Use Ollama, OpenAI, or Azure OpenAI.",
+        )
     try:
         request.app.state.config.RAG_EMBEDDING_ENGINE = form_data.RAG_EMBEDDING_ENGINE
         request.app.state.config.RAG_EMBEDDING_MODEL = form_data.RAG_EMBEDDING_MODEL
@@ -352,6 +402,9 @@ async def update_embedding_config(
         )
         request.app.state.config.ENABLE_ASYNC_EMBEDDING = (
             form_data.ENABLE_ASYNC_EMBEDDING
+        )
+        request.app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS = (
+            form_data.RAG_EMBEDDING_CONCURRENT_REQUESTS
         )
 
         if request.app.state.config.RAG_EMBEDDING_ENGINE in [
@@ -420,6 +473,7 @@ async def update_embedding_config(
                 else None
             ),
             enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
+            concurrent_requests=request.app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
         )
 
         return {
@@ -428,6 +482,7 @@ async def update_embedding_config(
             "RAG_EMBEDDING_MODEL": request.app.state.config.RAG_EMBEDDING_MODEL,
             "RAG_EMBEDDING_BATCH_SIZE": request.app.state.config.RAG_EMBEDDING_BATCH_SIZE,
             "ENABLE_ASYNC_EMBEDDING": request.app.state.config.ENABLE_ASYNC_EMBEDDING,
+            "RAG_EMBEDDING_CONCURRENT_REQUESTS": request.app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
             "openai_config": {
                 "url": request.app.state.config.RAG_OPENAI_API_BASE_URL,
                 "key": request.app.state.config.RAG_OPENAI_API_KEY,
@@ -468,6 +523,7 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
         # Content extraction settings
         "CONTENT_EXTRACTION_ENGINE": request.app.state.config.CONTENT_EXTRACTION_ENGINE,
         "PDF_EXTRACT_IMAGES": request.app.state.config.PDF_EXTRACT_IMAGES,
+        "PDF_LOADER_MODE": request.app.state.config.PDF_LOADER_MODE,
         "DATALAB_MARKER_API_KEY": request.app.state.config.DATALAB_MARKER_API_KEY,
         "DATALAB_MARKER_API_BASE_URL": request.app.state.config.DATALAB_MARKER_API_BASE_URL,
         "DATALAB_MARKER_ADDITIONAL_CONFIG": request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
@@ -499,6 +555,7 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
         # Reranking settings
         "RAG_RERANKING_MODEL": request.app.state.config.RAG_RERANKING_MODEL,
         "RAG_RERANKING_ENGINE": request.app.state.config.RAG_RERANKING_ENGINE,
+        "RAG_RERANKING_PRESET_MODELS": request.app.state.config.RAG_RERANKING_PRESET_MODELS,
         "RAG_EXTERNAL_RERANKER_URL": request.app.state.config.RAG_EXTERNAL_RERANKER_URL,
         "RAG_EXTERNAL_RERANKER_API_KEY": request.app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
         "RAG_EXTERNAL_RERANKER_TIMEOUT": request.app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
@@ -577,6 +634,10 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
             "YOUTUBE_LOADER_LANGUAGE": request.app.state.config.YOUTUBE_LOADER_LANGUAGE,
             "YOUTUBE_LOADER_PROXY_URL": request.app.state.config.YOUTUBE_LOADER_PROXY_URL,
             "YOUTUBE_LOADER_TRANSLATION": request.app.state.YOUTUBE_LOADER_TRANSLATION,
+            "YANDEX_WEB_SEARCH_URL": request.app.state.config.YANDEX_WEB_SEARCH_URL,
+            "YANDEX_WEB_SEARCH_API_KEY": request.app.state.config.YANDEX_WEB_SEARCH_API_KEY,
+            "YANDEX_WEB_SEARCH_CONFIG": request.app.state.config.YANDEX_WEB_SEARCH_CONFIG,
+            "YOUCOM_API_KEY": request.app.state.config.YOUCOM_API_KEY,
         },
     }
 
@@ -640,6 +701,10 @@ class WebConfig(BaseModel):
     YOUTUBE_LOADER_LANGUAGE: Optional[List[str]] = None
     YOUTUBE_LOADER_PROXY_URL: Optional[str] = None
     YOUTUBE_LOADER_TRANSLATION: Optional[str] = None
+    YANDEX_WEB_SEARCH_URL: Optional[str] = None
+    YANDEX_WEB_SEARCH_API_KEY: Optional[str] = None
+    YANDEX_WEB_SEARCH_CONFIG: Optional[str] = None
+    YOUCOM_API_KEY: Optional[str] = None
 
 
 class ConfigForm(BaseModel):
@@ -659,6 +724,7 @@ class ConfigForm(BaseModel):
     # Content extraction settings
     CONTENT_EXTRACTION_ENGINE: Optional[str] = None
     PDF_EXTRACT_IMAGES: Optional[bool] = None
+    PDF_LOADER_MODE: Optional[str] = None
 
     DATALAB_MARKER_API_KEY: Optional[str] = None
     DATALAB_MARKER_API_BASE_URL: Optional[str] = None
@@ -695,6 +761,7 @@ class ConfigForm(BaseModel):
     # Reranking settings
     RAG_RERANKING_MODEL: Optional[str] = None
     RAG_RERANKING_ENGINE: Optional[str] = None
+    RAG_RERANKING_PRESET_MODELS: Optional[List[str]] = None
     RAG_EXTERNAL_RERANKER_URL: Optional[str] = None
     RAG_EXTERNAL_RERANKER_API_KEY: Optional[str] = None
     RAG_EXTERNAL_RERANKER_TIMEOUT: Optional[str] = None
@@ -707,10 +774,10 @@ class ConfigForm(BaseModel):
     CHUNK_OVERLAP: Optional[int] = None
 
     # File upload settings
-    FILE_MAX_SIZE: Optional[int] = None
-    FILE_MAX_COUNT: Optional[int] = None
-    FILE_IMAGE_COMPRESSION_WIDTH: Optional[int] = None
-    FILE_IMAGE_COMPRESSION_HEIGHT: Optional[int] = None
+    FILE_MAX_SIZE: Optional[Union[int, str]] = None
+    FILE_MAX_COUNT: Optional[Union[int, str]] = None
+    FILE_IMAGE_COMPRESSION_WIDTH: Optional[Union[int, str]] = None
+    FILE_IMAGE_COMPRESSION_HEIGHT: Optional[Union[int, str]] = None
     ALLOWED_FILE_EXTENSIONS: Optional[List[str]] = None
 
     # Integration settings
@@ -785,6 +852,11 @@ async def update_rag_config(
         form_data.PDF_EXTRACT_IMAGES
         if form_data.PDF_EXTRACT_IMAGES is not None
         else request.app.state.config.PDF_EXTRACT_IMAGES
+    )
+    request.app.state.config.PDF_LOADER_MODE = (
+        form_data.PDF_LOADER_MODE
+        if form_data.PDF_LOADER_MODE is not None
+        else request.app.state.config.PDF_LOADER_MODE
     )
     request.app.state.config.DATALAB_MARKER_API_KEY = (
         form_data.DATALAB_MARKER_API_KEY
@@ -925,6 +997,19 @@ async def update_rag_config(
         else request.app.state.config.MINERU_PARAMS
     )
 
+    preset_models = (
+        normalize_reranking_preset_models(form_data.RAG_RERANKING_PRESET_MODELS)
+        if form_data.RAG_RERANKING_PRESET_MODELS is not None
+        else request.app.state.config.RAG_RERANKING_PRESET_MODELS
+    )
+    request.app.state.config.RAG_RERANKING_PRESET_MODELS = preset_models
+
+    if form_data.RAG_RERANKING_ENGINE == "":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Local SentenceTransformers reranking is disabled. Use an external reranker instead.",
+        )
+
     # Reranking settings
     if request.app.state.config.RAG_RERANKING_ENGINE == "":
         # Unloading the internal reranker and clear VRAM memory
@@ -1006,6 +1091,11 @@ async def update_rag_config(
         if form_data.TEXT_SPLITTER is not None
         else request.app.state.config.TEXT_SPLITTER
     )
+    request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER = (
+        form_data.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER
+        if form_data.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER is not None
+        else request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER
+    )
     request.app.state.config.CHUNK_SIZE = (
         form_data.CHUNK_SIZE
         if form_data.CHUNK_SIZE is not None
@@ -1021,21 +1111,31 @@ async def update_rag_config(
         if form_data.CHUNK_OVERLAP is not None
         else request.app.state.config.CHUNK_OVERLAP
     )
-    request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER = (
-        form_data.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER
-        if form_data.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER is not None
-        else request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER
-    )
 
     # File upload settings
-    request.app.state.config.FILE_MAX_SIZE = form_data.FILE_MAX_SIZE
-    request.app.state.config.FILE_MAX_COUNT = form_data.FILE_MAX_COUNT
-    request.app.state.config.FILE_IMAGE_COMPRESSION_WIDTH = (
-        form_data.FILE_IMAGE_COMPRESSION_WIDTH
-    )
-    request.app.state.config.FILE_IMAGE_COMPRESSION_HEIGHT = (
-        form_data.FILE_IMAGE_COMPRESSION_HEIGHT
-    )
+    # Empty string means "clear to None" (unlimited/no compression),
+    # None means "don't change", int means "set to this value"
+    if form_data.FILE_MAX_SIZE is not None:
+        request.app.state.config.FILE_MAX_SIZE = (
+            None if form_data.FILE_MAX_SIZE == "" else form_data.FILE_MAX_SIZE
+        )
+    if form_data.FILE_MAX_COUNT is not None:
+        request.app.state.config.FILE_MAX_COUNT = (
+            None if form_data.FILE_MAX_COUNT == "" else form_data.FILE_MAX_COUNT
+        )
+    if form_data.FILE_IMAGE_COMPRESSION_WIDTH is not None:
+        request.app.state.config.FILE_IMAGE_COMPRESSION_WIDTH = (
+            None
+            if form_data.FILE_IMAGE_COMPRESSION_WIDTH == ""
+            else form_data.FILE_IMAGE_COMPRESSION_WIDTH
+        )
+    if form_data.FILE_IMAGE_COMPRESSION_HEIGHT is not None:
+        request.app.state.config.FILE_IMAGE_COMPRESSION_HEIGHT = (
+            None
+            if form_data.FILE_IMAGE_COMPRESSION_HEIGHT == ""
+            else form_data.FILE_IMAGE_COMPRESSION_HEIGHT
+        )
+
     request.app.state.config.ALLOWED_FILE_EXTENSIONS = (
         form_data.ALLOWED_FILE_EXTENSIONS
         if form_data.ALLOWED_FILE_EXTENSIONS is not None
@@ -1169,6 +1269,16 @@ async def update_rag_config(
         request.app.state.YOUTUBE_LOADER_TRANSLATION = (
             form_data.web.YOUTUBE_LOADER_TRANSLATION
         )
+        request.app.state.config.YANDEX_WEB_SEARCH_URL = (
+            form_data.web.YANDEX_WEB_SEARCH_URL
+        )
+        request.app.state.config.YANDEX_WEB_SEARCH_API_KEY = (
+            form_data.web.YANDEX_WEB_SEARCH_API_KEY
+        )
+        request.app.state.config.YANDEX_WEB_SEARCH_CONFIG = (
+            form_data.web.YANDEX_WEB_SEARCH_CONFIG
+        )
+        request.app.state.config.YOUCOM_API_KEY = form_data.web.YOUCOM_API_KEY
 
     return {
         "status": True,
@@ -1185,6 +1295,7 @@ async def update_rag_config(
         # Content extraction settings
         "CONTENT_EXTRACTION_ENGINE": request.app.state.config.CONTENT_EXTRACTION_ENGINE,
         "PDF_EXTRACT_IMAGES": request.app.state.config.PDF_EXTRACT_IMAGES,
+        "PDF_LOADER_MODE": request.app.state.config.PDF_LOADER_MODE,
         "DATALAB_MARKER_API_KEY": request.app.state.config.DATALAB_MARKER_API_KEY,
         "DATALAB_MARKER_API_BASE_URL": request.app.state.config.DATALAB_MARKER_API_BASE_URL,
         "DATALAB_MARKER_ADDITIONAL_CONFIG": request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
@@ -1215,6 +1326,7 @@ async def update_rag_config(
         # Reranking settings
         "RAG_RERANKING_MODEL": request.app.state.config.RAG_RERANKING_MODEL,
         "RAG_RERANKING_ENGINE": request.app.state.config.RAG_RERANKING_ENGINE,
+        "RAG_RERANKING_PRESET_MODELS": request.app.state.config.RAG_RERANKING_PRESET_MODELS,
         "RAG_EXTERNAL_RERANKER_URL": request.app.state.config.RAG_EXTERNAL_RERANKER_URL,
         "RAG_EXTERNAL_RERANKER_API_KEY": request.app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
         "RAG_EXTERNAL_RERANKER_TIMEOUT": request.app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
@@ -1292,6 +1404,10 @@ async def update_rag_config(
             "YOUTUBE_LOADER_LANGUAGE": request.app.state.config.YOUTUBE_LOADER_LANGUAGE,
             "YOUTUBE_LOADER_PROXY_URL": request.app.state.config.YOUTUBE_LOADER_PROXY_URL,
             "YOUTUBE_LOADER_TRANSLATION": request.app.state.YOUTUBE_LOADER_TRANSLATION,
+            "YANDEX_WEB_SEARCH_URL": request.app.state.config.YANDEX_WEB_SEARCH_URL,
+            "YANDEX_WEB_SEARCH_API_KEY": request.app.state.config.YANDEX_WEB_SEARCH_API_KEY,
+            "YANDEX_WEB_SEARCH_CONFIG": request.app.state.config.YANDEX_WEB_SEARCH_CONFIG,
+            "YOUCOM_API_KEY": request.app.state.config.YOUCOM_API_KEY,
         },
     }
 
@@ -1323,32 +1439,24 @@ def merge_docs_to_target_size(
 ) -> list[Document]:
     """
     Best-effort normalization of chunk sizes.
-
-    Attempts to grow small chunks up to a desired minimum size,
-    without exceeding the maximum size or crossing source/file
-    boundaries.
+    AIH-Infra: accepts metadata for KB-level params.
     """
-    # Minimum size is always global (hard constraint from admin)
     min_chunk_size_target = request.app.state.config.CHUNK_MIN_SIZE_TARGET
-    # Maximum size uses KB-level parameter if provided, otherwise global config
-    max_chunk_size = metadata.get("chunk_size") if metadata and metadata.get("chunk_size") is not None else request.app.state.config.CHUNK_SIZE
+    max_chunk_size = (metadata.get("chunk_size") if metadata and metadata.get("chunk_size") is not None
+                      else request.app.state.config.CHUNK_SIZE)
 
     if min_chunk_size_target <= 0:
         return chunks
 
-    # Get text splitter type (KB-level > global) to determine measurement method
-    text_splitter_type = metadata.get("text_splitter") if metadata and metadata.get("text_splitter") is not None else request.app.state.config.TEXT_SPLITTER
-
     measure_chunk_size = len
-    if text_splitter_type == "token":
+    _splitter = (metadata.get("text_splitter") if metadata and metadata.get("text_splitter") is not None
+                 else request.app.state.config.TEXT_SPLITTER)
+    if _splitter == "token":
         encoding = tiktoken.get_encoding(
             str(request.app.state.config.TIKTOKEN_ENCODING_NAME)
         )
         measure_chunk_size = lambda text: len(encoding.encode(text))
 
-    # Define threshold for "tiny chunks" (e.g., header-only chunks)
-    # Should be smaller than min_chunk_size_target to avoid over-merging
-    # Use 1/3 of min_target, with bounds [100, 300]
     TINY_CHUNK_THRESHOLD = max(100, min(300, min_chunk_size_target // 3))
 
     processed_chunks: list[Document] = []
@@ -1356,7 +1464,6 @@ def merge_docs_to_target_size(
     current_chunk: Document | None = None
     current_content: str = ""
 
-    # Phase 1: Forward merge with improved logic
     for next_chunk in chunks:
         if current_chunk is None:
             current_chunk = next_chunk
@@ -1364,16 +1471,12 @@ def merge_docs_to_target_size(
             continue  # First chunk initialization
 
         proposed_content = f"{current_content}\n\n{next_chunk.page_content}"
-        next_size = measure_chunk_size(next_chunk.page_content)
 
         can_merge = (
             can_merge_chunks(current_chunk, next_chunk)
             and (
-                # Condition A: Current chunk is below target (original logic)
                 measure_chunk_size(current_content) < min_chunk_size_target
-                or
-                # Condition B: Next chunk is tiny (new logic - absorb tiny chunks)
-                next_size < TINY_CHUNK_THRESHOLD
+                or measure_chunk_size(next_chunk.page_content) < TINY_CHUNK_THRESHOLD
             )
             and measure_chunk_size(proposed_content) <= max_chunk_size
         )
@@ -1398,28 +1501,20 @@ def merge_docs_to_target_size(
             )
         )
 
-    # Phase 2: Backward merge for remaining tiny chunks
-    # If a chunk is still tiny after forward merge, try to merge it backward
+    # AIH-Infra: Phase 2 — backward merge for remaining tiny chunks
     final_chunks: list[Document] = []
-    for i, chunk in enumerate(processed_chunks):
+    for chunk in processed_chunks:
         chunk_size = measure_chunk_size(chunk.page_content)
-
-        # If this chunk is tiny and we have a previous chunk to merge with
         if chunk_size < TINY_CHUNK_THRESHOLD and len(final_chunks) > 0:
-            prev_chunk = final_chunks[-1]
-            # Check if we can merge backward
-            if can_merge_chunks(prev_chunk, chunk):
-                proposed_content = f"{prev_chunk.page_content}\n\n{chunk.page_content}"
-                if measure_chunk_size(proposed_content) <= max_chunk_size:
-                    # Merge backward: update the previous chunk
+            prev = final_chunks[-1]
+            if can_merge_chunks(prev, chunk):
+                proposed = f"{prev.page_content}\n\n{chunk.page_content}"
+                if measure_chunk_size(proposed) <= max_chunk_size:
                     final_chunks[-1] = Document(
-                        page_content=proposed_content,
-                        metadata={**prev_chunk.metadata},
+                        page_content=proposed,
+                        metadata={**prev.metadata},
                     )
-                    log.info(f"Backward merged tiny chunk ({chunk_size} chars) into previous chunk")
                     continue
-
-        # If we couldn't merge backward, keep the chunk as is
         final_chunks.append(chunk)
 
     return final_chunks
@@ -1451,6 +1546,20 @@ def save_docs_to_vector_db(
 
         return ", ".join(docs_info)
 
+    def _get_page_tracking_source_key(doc: Document) -> str:
+        doc_metadata = getattr(doc, "metadata", {}) or {}
+        stable_metadata = {
+            "file_id": doc_metadata.get("file_id"),
+            "source": doc_metadata.get("source"),
+            "name": doc_metadata.get("name"),
+            "title": doc_metadata.get("title"),
+            "page": doc_metadata.get("page"),
+            "page_label": doc_metadata.get("page_label"),
+            "total_pages": doc_metadata.get("total_pages"),
+            "hash": doc_metadata.get("hash"),
+        }
+        return json.dumps(stable_metadata, sort_keys=True, default=str)
+
     log.debug(
         f"save_docs_to_vector_db: document {_get_docs_info(docs)} {collection_name}"
     )
@@ -1465,33 +1574,37 @@ def save_docs_to_vector_db(
         if result is not None and result.ids and len(result.ids) > 0:
             existing_doc_ids = result.ids[0]
             if existing_doc_ids:
-                log.info(f"Document with hash {metadata['hash']} already exists")
-                raise ValueError(ERROR_MESSAGES.DUPLICATE_CONTENT)
+                # Check if the existing document belongs to the same file
+                # If same file_id, this is a re-add/reindex - allow it
+                # If different file_id, this is a duplicate - block it
+                existing_file_id = None
+                if result.metadatas and result.metadatas[0]:
+                    existing_file_id = result.metadatas[0][0].get("file_id")
+
+                if existing_file_id != metadata.get("file_id"):
+                    log.info(f"Document with hash {metadata['hash']} already exists")
+                    raise ValueError(ERROR_MESSAGES.DUPLICATE_CONTENT)
+
+    source_docs_for_page_tracking = [
+        Document(page_content=doc.page_content, metadata={**doc.metadata}) for doc in docs
+    ]
+
+    # AIH-Infra: Extract KB-level RAG params from metadata
+    _chunk_size = (metadata.get("chunk_size") if metadata and metadata.get("chunk_size") is not None
+                   else request.app.state.config.CHUNK_SIZE)
+    _chunk_overlap = (metadata.get("chunk_overlap") if metadata and metadata.get("chunk_overlap") is not None
+                      else request.app.state.config.CHUNK_OVERLAP)
+    _text_splitter = (metadata.get("text_splitter") if metadata and metadata.get("text_splitter") is not None
+                      else request.app.state.config.TEXT_SPLITTER)
+    _enable_markdown = (metadata.get("enable_markdown_splitting") if metadata and metadata.get("enable_markdown_splitting") is not None
+                        else request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER)
 
     if split:
-        # Flag to track if markdown splitter was used
+        # AIH-Infra: markdown_split_done flag prevents double-chunking
         markdown_split_done = False
 
-        # Get KB-level settings
-        kb_markdown_enabled = metadata.get("enable_markdown_splitting") if metadata else None
-
-        # Decide whether to use markdown splitter with priority logic:
-        # 1. If KB explicitly sets enable_markdown_splitting (not None), use that
-        # 2. Otherwise, use global setting
-        # Note: text_splitter parameter is independent and controls secondary splitter type
-        use_markdown_splitter = False
-        if kb_markdown_enabled is not None:
-            # KB explicitly specified markdown splitting preference
-            use_markdown_splitter = kb_markdown_enabled
-            log.info(f"Using KB-level markdown splitting setting: {kb_markdown_enabled}")
-        else:
-            # KB did not specify markdown splitting, use global setting
-            use_markdown_splitter = request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER
-            log.info(f"Using global markdown splitting setting: {use_markdown_splitter}")
-
-        if use_markdown_splitter:
-            log.info("Applying markdown header text splitter")
-            # Define headers to split on - covering most common markdown header levels
+        if _enable_markdown:
+            log.info("Using markdown header text splitter")
             markdown_splitter = MarkdownHeaderTextSplitter(
                 headers_to_split_on=[
                     ("#", "Header 1"),
@@ -1501,7 +1614,7 @@ def save_docs_to_vector_db(
                     ("#####", "Header 5"),
                     ("######", "Header 6"),
                 ],
-                strip_headers=False,  # Keep headers in content for context
+                strip_headers=False,
             )
 
             split_docs = []
@@ -1517,111 +1630,106 @@ def save_docs_to_vector_db(
                         )
                     ]
                 )
-
             docs = split_docs
 
-            # Get chunk parameters
-            chunk_size = metadata.get("chunk_size") if metadata and metadata.get("chunk_size") is not None else request.app.state.config.CHUNK_SIZE
-            chunk_overlap = metadata.get("chunk_overlap") if metadata and metadata.get("chunk_overlap") is not None else request.app.state.config.CHUNK_OVERLAP
-            # Get text splitter type (KB-level > global)
-            text_splitter_type = metadata.get("text_splitter") if metadata and metadata.get("text_splitter") is not None else request.app.state.config.TEXT_SPLITTER
-
-            # DEBUG: Log the chunk parameters being used
-            log.info(f"[MARKDOWN PATH] Using chunk_size={chunk_size}, chunk_overlap={chunk_overlap}, text_splitter_type={text_splitter_type}")
-            log.info(f"[MARKDOWN PATH] metadata={metadata}")
-            log.info(f"[MARKDOWN PATH] Global CHUNK_SIZE={request.app.state.config.CHUNK_SIZE}")
-
-            # Step 2: Split oversized chunks using secondary splitter (with overlap)
-            # Create measure function based on splitter type
-            if text_splitter_type == "token":
-                encoding = tiktoken.get_encoding(str(request.app.state.config.TIKTOKEN_ENCODING_NAME))
-                measure_size = lambda text: len(encoding.encode(text))
+            # AIH-Infra: Secondary splitter for oversized chunks after markdown split
+            if _text_splitter == "token":
+                measure_size = lambda text: len(tiktoken.get_encoding(str(request.app.state.config.TIKTOKEN_ENCODING_NAME)).encode(text))
                 secondary_splitter = TokenTextSplitter(
                     encoding_name=str(request.app.state.config.TIKTOKEN_ENCODING_NAME),
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                    add_start_index=True,
+                    chunk_size=_chunk_size, chunk_overlap=_chunk_overlap, add_start_index=True,
                 )
             else:
                 measure_size = len
                 secondary_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                    add_start_index=True,
+                    chunk_size=_chunk_size, chunk_overlap=_chunk_overlap, add_start_index=True,
                 )
 
-            # Only split chunks that exceed max size
+            # Split only oversized chunks
             final_docs = []
             for doc in docs:
-                if measure_size(doc.page_content) > chunk_size:
+                if measure_size(doc.page_content) > _chunk_size:
                     final_docs.extend(secondary_splitter.split_documents([doc]))
                 else:
                     final_docs.append(doc)
-
             docs = final_docs
-            log.info(f"After splitting oversized chunks: {len(docs)} chunks")
 
-            # Step 3: Merge small chunks (preserves document order)
+            # Merge tiny chunks
             if request.app.state.config.CHUNK_MIN_SIZE_TARGET > 0:
                 docs = merge_docs_to_target_size(request, docs, metadata)
 
-            # Mark that markdown splitting is done - skip subsequent text splitters
             markdown_split_done = True
-            log.info(f"Markdown splitting complete. Generated {len(docs)} chunks.")
 
-        # Only apply character/token splitter if markdown splitter was not used
-        if not markdown_split_done and request.app.state.config.TEXT_SPLITTER in ["", "character"]:
-            # Use KB-level parameters if provided, otherwise fall back to global config
-            chunk_size = metadata.get("chunk_size") if metadata and metadata.get("chunk_size") is not None else request.app.state.config.CHUNK_SIZE
-            chunk_overlap = metadata.get("chunk_overlap") if metadata and metadata.get("chunk_overlap") is not None else request.app.state.config.CHUNK_OVERLAP
-            text_splitter_type = metadata.get("text_splitter") if metadata and metadata.get("text_splitter") is not None else request.app.state.config.TEXT_SPLITTER
-
-            # DEBUG: Log the chunk parameters being used
-            log.info(f"[PURE TOKEN PATH] Using chunk_size={chunk_size}, chunk_overlap={chunk_overlap}, text_splitter_type={text_splitter_type}")
-            log.info(f"[PURE TOKEN PATH] metadata={metadata}")
-            log.info(f"[PURE TOKEN PATH] Global CHUNK_SIZE={request.app.state.config.CHUNK_SIZE}")
-
-            # Override splitter type if KB specifies it
-            if text_splitter_type == "token":
+        # AIH-Infra: guard — skip character/token splitter if markdown already handled
+        if not markdown_split_done:
+            if _text_splitter in ["", "character"]:
+                text_splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=_chunk_size,
+                    chunk_overlap=_chunk_overlap,
+                    add_start_index=True,
+                )
+                docs = text_splitter.split_documents(docs)
+            elif _text_splitter == "token":
                 log.info(
-                    f"Using token text splitter (KB override): {request.app.state.config.TIKTOKEN_ENCODING_NAME}"
+                    f"Using token text splitter: {request.app.state.config.TIKTOKEN_ENCODING_NAME}"
                 )
                 tiktoken.get_encoding(str(request.app.state.config.TIKTOKEN_ENCODING_NAME))
                 text_splitter = TokenTextSplitter(
                     encoding_name=str(request.app.state.config.TIKTOKEN_ENCODING_NAME),
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
+                    chunk_size=_chunk_size,
+                    chunk_overlap=_chunk_overlap,
                     add_start_index=True,
                 )
+                docs = text_splitter.split_documents(docs)
             else:
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                    add_start_index=True,
-                )
-            docs = text_splitter.split_documents(docs)
-        elif not markdown_split_done and request.app.state.config.TEXT_SPLITTER == "token":
-            log.info(
-                f"Using token text splitter: {request.app.state.config.TIKTOKEN_ENCODING_NAME}"
-            )
-
-            # Use KB-level parameters if provided, otherwise fall back to global config
-            chunk_size = metadata.get("chunk_size") if metadata and metadata.get("chunk_size") is not None else request.app.state.config.CHUNK_SIZE
-            chunk_overlap = metadata.get("chunk_overlap") if metadata and metadata.get("chunk_overlap") is not None else request.app.state.config.CHUNK_OVERLAP
-
-            tiktoken.get_encoding(str(request.app.state.config.TIKTOKEN_ENCODING_NAME))
-            text_splitter = TokenTextSplitter(
-                encoding_name=str(request.app.state.config.TIKTOKEN_ENCODING_NAME),
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                add_start_index=True,
-            )
-            docs = text_splitter.split_documents(docs)
-        elif not markdown_split_done:
-            raise ValueError(ERROR_MESSAGES.DEFAULT("Invalid text splitter"))
+                raise ValueError(ERROR_MESSAGES.DEFAULT("Invalid text splitter"))
 
     if len(docs) == 0:
         raise ValueError(ERROR_MESSAGES.EMPTY_CONTENT)
+
+    source_doc_texts: dict[str, str] = {}
+    source_doc_anchors: dict[str, dict] = {}
+    for source_doc in source_docs_for_page_tracking:
+        source_key = _get_page_tracking_source_key(source_doc)
+        if source_key not in source_doc_texts:
+            source_doc_texts[source_key] = source_doc.page_content or ""
+            source_doc_anchors[source_key] = extract_all_page_anchors(
+                source_doc.page_content or ""
+            )
+
+    enriched_docs = []
+    for doc in docs:
+        source_key = _get_page_tracking_source_key(doc)
+        full_text = source_doc_texts.get(source_key, doc.page_content or "")
+        anchors = source_doc_anchors.get(source_key, {"pdf": [], "print": []})
+
+        page_metadata = get_chunk_page_metadata(
+            doc.page_content or "",
+            full_text,
+            pdf_anchors=anchors.get("pdf", []),
+            print_anchors=anchors.get("print", []),
+        )
+
+        merged_metadata = {**doc.metadata}
+        if isinstance(merged_metadata.get("page"), int):
+            merged_metadata.setdefault("page_start", merged_metadata["page"] + 1)
+            merged_metadata.setdefault("page_end", merged_metadata["page"] + 1)
+        elif isinstance(merged_metadata.get("page_label"), int):
+            merged_metadata.setdefault("page_start", merged_metadata["page_label"])
+            merged_metadata.setdefault("page_end", merged_metadata["page_label"])
+
+        # AIH-Infra: final chunk page ranges must be recomputed from final content.
+        # Always overwrite both PDF page ranges (page_start/page_end) and
+        # printed page ranges (print_page_start/print_page_end) when available.
+        for key in ["page_start", "page_end", "print_page_start", "print_page_end"]:
+            if key in page_metadata:
+                merged_metadata[key] = page_metadata[key]
+
+        enriched_docs.append(
+            Document(page_content=doc.page_content, metadata=merged_metadata)
+        )
+
+    docs = enriched_docs
 
     texts = [sanitize_text_for_db(doc.page_content) for doc in docs]
     metadatas = [
@@ -1679,16 +1787,22 @@ def save_docs_to_vector_db(
                 else None
             ),
             enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
+            concurrent_requests=request.app.state.config.RAG_EMBEDDING_CONCURRENT_REQUESTS,
         )
 
-        # Run async embedding in sync context
-        embeddings = asyncio.run(
+        # Run async embedding in sync context using the main event loop
+        # This allows the main loop to stay responsive to health checks during long operations
+        embedding_timeout = RAG_EMBEDDING_TIMEOUT
+
+        future = asyncio.run_coroutine_threadsafe(
             embedding_function(
                 list(map(lambda x: x.replace("\n", " "), texts)),
                 prefix=RAG_EMBEDDING_CONTENT_PREFIX,
                 user=user,
-            )
+            ),
+            request.app.state.main_loop,
         )
+        embeddings = future.result(timeout=embedding_timeout)
         log.info(f"embeddings generated {len(embeddings)} for {len(texts)} items")
 
         items = [
@@ -1718,11 +1832,81 @@ class ProcessFileForm(BaseModel):
     file_id: str
     content: Optional[str] = None
     collection_name: Optional[str] = None
-    # Optional KB-level chunking parameters
+    bypass_file_collection_cache: bool = False
+    # AIH-Infra: KB-level RAG parameters
     chunk_size: Optional[int] = None
     chunk_overlap: Optional[int] = None
     text_splitter: Optional[str] = None
     enable_markdown_splitting: Optional[bool] = None
+
+
+def _load_raw_docs_for_file(request: Request, file, user) -> tuple[list[Document], str]:
+    file_path = file.path
+    if file_path:
+        file_path = Storage.get_file(file_path)
+        loader = Loader(
+            engine=request.app.state.config.CONTENT_EXTRACTION_ENGINE,
+            user=user,
+            DATALAB_MARKER_API_KEY=request.app.state.config.DATALAB_MARKER_API_KEY,
+            DATALAB_MARKER_API_BASE_URL=request.app.state.config.DATALAB_MARKER_API_BASE_URL,
+            DATALAB_MARKER_ADDITIONAL_CONFIG=request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
+            DATALAB_MARKER_SKIP_CACHE=request.app.state.config.DATALAB_MARKER_SKIP_CACHE,
+            DATALAB_MARKER_FORCE_OCR=request.app.state.config.DATALAB_MARKER_FORCE_OCR,
+            DATALAB_MARKER_PAGINATE=request.app.state.config.DATALAB_MARKER_PAGINATE,
+            DATALAB_MARKER_STRIP_EXISTING_OCR=request.app.state.config.DATALAB_MARKER_STRIP_EXISTING_OCR,
+            DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION=request.app.state.config.DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION,
+            DATALAB_MARKER_FORMAT_LINES=request.app.state.config.DATALAB_MARKER_FORMAT_LINES,
+            DATALAB_MARKER_USE_LLM=request.app.state.config.DATALAB_MARKER_USE_LLM,
+            DATALAB_MARKER_OUTPUT_FORMAT=request.app.state.config.DATALAB_MARKER_OUTPUT_FORMAT,
+            EXTERNAL_DOCUMENT_LOADER_URL=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_URL,
+            EXTERNAL_DOCUMENT_LOADER_API_KEY=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_API_KEY,
+            TIKA_SERVER_URL=request.app.state.config.TIKA_SERVER_URL,
+            DOCLING_SERVER_URL=request.app.state.config.DOCLING_SERVER_URL,
+            DOCLING_API_KEY=request.app.state.config.DOCLING_API_KEY,
+            DOCLING_PARAMS=request.app.state.config.DOCLING_PARAMS,
+            PDF_EXTRACT_IMAGES=request.app.state.config.PDF_EXTRACT_IMAGES,
+            PDF_LOADER_MODE=request.app.state.config.PDF_LOADER_MODE,
+            DOCUMENT_INTELLIGENCE_ENDPOINT=request.app.state.config.DOCUMENT_INTELLIGENCE_ENDPOINT,
+            DOCUMENT_INTELLIGENCE_KEY=request.app.state.config.DOCUMENT_INTELLIGENCE_KEY,
+            DOCUMENT_INTELLIGENCE_MODEL=request.app.state.config.DOCUMENT_INTELLIGENCE_MODEL,
+            MISTRAL_OCR_API_BASE_URL=request.app.state.config.MISTRAL_OCR_API_BASE_URL,
+            MISTRAL_OCR_API_KEY=request.app.state.config.MISTRAL_OCR_API_KEY,
+            MINERU_API_MODE=request.app.state.config.MINERU_API_MODE,
+            MINERU_API_URL=request.app.state.config.MINERU_API_URL,
+            MINERU_API_KEY=request.app.state.config.MINERU_API_KEY,
+            MINERU_API_TIMEOUT=request.app.state.config.MINERU_API_TIMEOUT,
+            MINERU_PARAMS=request.app.state.config.MINERU_PARAMS,
+        )
+        docs = loader.load(file.filename, file.meta.get("content_type"), file_path)
+        docs = [
+            Document(
+                page_content=doc.page_content,
+                metadata={
+                    **filter_metadata(doc.metadata),
+                    "name": file.filename,
+                    "created_by": file.user_id,
+                    "file_id": file.id,
+                    "source": file.filename,
+                },
+            )
+            for doc in docs
+        ]
+        text_content = " ".join([doc.page_content for doc in docs])
+        return docs, text_content
+
+    text_content = file.data.get("content", "")
+    return [
+        Document(
+            page_content=text_content,
+            metadata={
+                **file.meta,
+                "name": file.filename,
+                "created_by": file.user_id,
+                "file_id": file.id,
+                "source": file.filename,
+            },
+        )
+    ], text_content
 
 
 @router.post("/process/file")
@@ -1734,15 +1918,10 @@ def process_file(
 ):
     """
     Process a file and save its content to the vector database.
+    Process a file and save its content to the vector database.
+    Note: granular session management is used to prevent connection pool exhaustion.
+    The session is committed before external API calls, and updates use a fresh session.
     """
-    # DEBUG: Log form_data parameters
-    log.info(f"[PROCESS_FILE] form_data.file_id={form_data.file_id}")
-    log.info(f"[PROCESS_FILE] form_data.collection_name={form_data.collection_name}")
-    log.info(f"[PROCESS_FILE] form_data.chunk_size={form_data.chunk_size}")
-    log.info(f"[PROCESS_FILE] form_data.chunk_overlap={form_data.chunk_overlap}")
-    log.info(f"[PROCESS_FILE] form_data.text_splitter={form_data.text_splitter}")
-    log.info(f"[PROCESS_FILE] form_data.enable_markdown_splitting={form_data.enable_markdown_splitting}")
-
     if user.role == "admin":
         file = Files.get_file_by_id(form_data.file_id, db=db)
     else:
@@ -1784,26 +1963,25 @@ def process_file(
 
                 text_content = form_data.content
             elif form_data.collection_name:
-                # Check if the file has already been processed and save the content
-                # Usage: /knowledge/{id}/file/add, /knowledge/{id}/file/update
-
-                # Check if KB-level chunking parameters are provided
-                has_kb_params = (
-                    form_data.chunk_size is not None
-                    or form_data.chunk_overlap is not None
-                    or form_data.text_splitter is not None
-                    or form_data.enable_markdown_splitting is not None
+                # Usage: /knowledge/{id}/file/add, /knowledge/{id}/file/update, /knowledge/reindex
+                has_knowledge_overrides = any(
+                    value is not None
+                    for value in [
+                        form_data.chunk_size,
+                        form_data.chunk_overlap,
+                        form_data.text_splitter,
+                        form_data.enable_markdown_splitting,
+                    ]
                 )
 
-                # If KB parameters are provided, force reprocessing to use new parameters
-                # Otherwise, reuse existing chunks if available
-                if not has_kb_params:
+                if form_data.bypass_file_collection_cache or has_knowledge_overrides:
+                    docs, text_content = _load_raw_docs_for_file(request, file, user)
+                else:
                     result = VECTOR_DB_CLIENT.query(
                         collection_name=f"file-{file.id}", filter={"file_id": file.id}
                     )
 
                     if result is not None and len(result.ids[0]) > 0:
-                        log.info(f"Reusing existing chunks for file {file.id} (no KB params)")
                         docs = [
                             Document(
                                 page_content=result.documents[0][idx],
@@ -1811,105 +1989,13 @@ def process_file(
                             )
                             for idx, id in enumerate(result.ids[0])
                         ]
+                        text_content = file.data.get("content", "")
                     else:
-                        docs = [
-                            Document(
-                                page_content=file.data.get("content", ""),
-                                metadata={
-                                    **file.meta,
-                                    "name": file.filename,
-                                    "created_by": file.user_id,
-                                    "file_id": file.id,
-                                    "source": file.filename,
-                                },
-                            )
-                        ]
-                else:
-                    # KB parameters provided, force reprocessing with new parameters
-                    log.info(f"Force reprocessing file {file.id} with KB params: chunk_size={form_data.chunk_size}, chunk_overlap={form_data.chunk_overlap}, text_splitter={form_data.text_splitter}")
-                    docs = [
-                        Document(
-                            page_content=file.data.get("content", ""),
-                            metadata={
-                                **file.meta,
-                                "name": file.filename,
-                                "created_by": file.user_id,
-                                "file_id": file.id,
-                                "source": file.filename,
-                            },
-                        )
-                    ]
-
-                text_content = file.data.get("content", "")
+                        docs, text_content = _load_raw_docs_for_file(request, file, user)
             else:
                 # Process the file and save the content
                 # Usage: /files/
-                file_path = file.path
-                if file_path:
-                    file_path = Storage.get_file(file_path)
-                    loader = Loader(
-                        engine=request.app.state.config.CONTENT_EXTRACTION_ENGINE,
-                        user=user,
-                        DATALAB_MARKER_API_KEY=request.app.state.config.DATALAB_MARKER_API_KEY,
-                        DATALAB_MARKER_API_BASE_URL=request.app.state.config.DATALAB_MARKER_API_BASE_URL,
-                        DATALAB_MARKER_ADDITIONAL_CONFIG=request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
-                        DATALAB_MARKER_SKIP_CACHE=request.app.state.config.DATALAB_MARKER_SKIP_CACHE,
-                        DATALAB_MARKER_FORCE_OCR=request.app.state.config.DATALAB_MARKER_FORCE_OCR,
-                        DATALAB_MARKER_PAGINATE=request.app.state.config.DATALAB_MARKER_PAGINATE,
-                        DATALAB_MARKER_STRIP_EXISTING_OCR=request.app.state.config.DATALAB_MARKER_STRIP_EXISTING_OCR,
-                        DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION=request.app.state.config.DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION,
-                        DATALAB_MARKER_FORMAT_LINES=request.app.state.config.DATALAB_MARKER_FORMAT_LINES,
-                        DATALAB_MARKER_USE_LLM=request.app.state.config.DATALAB_MARKER_USE_LLM,
-                        DATALAB_MARKER_OUTPUT_FORMAT=request.app.state.config.DATALAB_MARKER_OUTPUT_FORMAT,
-                        EXTERNAL_DOCUMENT_LOADER_URL=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_URL,
-                        EXTERNAL_DOCUMENT_LOADER_API_KEY=request.app.state.config.EXTERNAL_DOCUMENT_LOADER_API_KEY,
-                        TIKA_SERVER_URL=request.app.state.config.TIKA_SERVER_URL,
-                        DOCLING_SERVER_URL=request.app.state.config.DOCLING_SERVER_URL,
-                        DOCLING_API_KEY=request.app.state.config.DOCLING_API_KEY,
-                        DOCLING_PARAMS=request.app.state.config.DOCLING_PARAMS,
-                        PDF_EXTRACT_IMAGES=request.app.state.config.PDF_EXTRACT_IMAGES,
-                        DOCUMENT_INTELLIGENCE_ENDPOINT=request.app.state.config.DOCUMENT_INTELLIGENCE_ENDPOINT,
-                        DOCUMENT_INTELLIGENCE_KEY=request.app.state.config.DOCUMENT_INTELLIGENCE_KEY,
-                        DOCUMENT_INTELLIGENCE_MODEL=request.app.state.config.DOCUMENT_INTELLIGENCE_MODEL,
-                        MISTRAL_OCR_API_BASE_URL=request.app.state.config.MISTRAL_OCR_API_BASE_URL,
-                        MISTRAL_OCR_API_KEY=request.app.state.config.MISTRAL_OCR_API_KEY,
-                        MINERU_API_MODE=request.app.state.config.MINERU_API_MODE,
-                        MINERU_API_URL=request.app.state.config.MINERU_API_URL,
-                        MINERU_API_KEY=request.app.state.config.MINERU_API_KEY,
-                        MINERU_API_TIMEOUT=request.app.state.config.MINERU_API_TIMEOUT,
-                        MINERU_PARAMS=request.app.state.config.MINERU_PARAMS,
-                    )
-                    docs = loader.load(
-                        file.filename, file.meta.get("content_type"), file_path
-                    )
-
-                    docs = [
-                        Document(
-                            page_content=doc.page_content,
-                            metadata={
-                                **filter_metadata(doc.metadata),
-                                "name": file.filename,
-                                "created_by": file.user_id,
-                                "file_id": file.id,
-                                "source": file.filename,
-                            },
-                        )
-                        for doc in docs
-                    ]
-                else:
-                    docs = [
-                        Document(
-                            page_content=file.data.get("content", ""),
-                            metadata={
-                                **file.meta,
-                                "name": file.filename,
-                                "created_by": file.user_id,
-                                "file_id": file.id,
-                                "source": file.filename,
-                            },
-                        )
-                    ]
-                text_content = " ".join([doc.page_content for doc in docs])
+                docs, text_content = _load_raw_docs_for_file(request, file, user)
 
             log.debug(f"text_content: {text_content}")
             Files.update_file_data_by_id(
@@ -1930,53 +2016,61 @@ def process_file(
                 }
             else:
                 try:
-                    # Build metadata dictionary, only including non-None chunk parameters
-                    file_metadata = {
+                    # Commit any pending changes before the slow embedding step.
+                    # Note: file is already a Pydantic model (not ORM), so no expunge needed.
+                    db.commit()
+
+                    # External embedding API takes time (5-60s+).
+                    # Subsequent updates use fresh sessions via get_db().
+                    # AIH-Infra: Build metadata with KB-level RAG params
+                    metadata = {
                         "file_id": file.id,
                         "name": file.filename,
                         "hash": hash,
                     }
                     if form_data.chunk_size is not None:
-                        file_metadata["chunk_size"] = form_data.chunk_size
+                        metadata["chunk_size"] = form_data.chunk_size
                     if form_data.chunk_overlap is not None:
-                        file_metadata["chunk_overlap"] = form_data.chunk_overlap
+                        metadata["chunk_overlap"] = form_data.chunk_overlap
                     if form_data.text_splitter is not None:
-                        file_metadata["text_splitter"] = form_data.text_splitter
+                        metadata["text_splitter"] = form_data.text_splitter
                     if form_data.enable_markdown_splitting is not None:
-                        file_metadata["enable_markdown_splitting"] = form_data.enable_markdown_splitting
+                        metadata["enable_markdown_splitting"] = form_data.enable_markdown_splitting
 
                     result = save_docs_to_vector_db(
                         request,
                         docs=docs,
                         collection_name=collection_name,
-                        metadata=file_metadata,
+                        metadata=metadata,
                         add=(True if form_data.collection_name else False),
                         user=user,
                     )
                     log.info(f"added {len(docs)} items to collection {collection_name}")
 
                     if result:
-                        Files.update_file_metadata_by_id(
-                            file.id,
-                            {
+                        # Fresh session for the final update.
+                        with get_db() as session:
+                            Files.update_file_metadata_by_id(
+                                file.id,
+                                {
+                                    "collection_name": collection_name,
+                                },
+                                db=session,
+                            )
+
+                            Files.update_file_data_by_id(
+                                file.id,
+                                {"status": "completed"},
+                                db=session,
+                            )
+                            Files.update_file_hash_by_id(file.id, hash, db=session)
+
+                            return {
+                                "status": True,
                                 "collection_name": collection_name,
-                            },
-                            db=db,
-                        )
-
-                        Files.update_file_data_by_id(
-                            file.id,
-                            {"status": "completed"},
-                            db=db,
-                        )
-                        Files.update_file_hash_by_id(file.id, hash, db=db)
-
-                        return {
-                            "status": True,
-                            "collection_name": collection_name,
-                            "filename": file.filename,
-                            "content": text_content,
-                        }
+                                "filename": file.filename,
+                                "content": text_content,
+                            }
                     else:
                         raise Exception("Error saving document to vector database")
                 except Exception as e:
@@ -1984,13 +2078,15 @@ def process_file(
 
         except Exception as e:
             log.exception(e)
-            Files.update_file_data_by_id(
-                file.id,
-                {"status": "failed"},
-                db=db,
-            )
-            # Clear the hash so the file can be re-uploaded after fixing the issue
-            Files.update_file_hash_by_id(file.id, None, db=db)
+            # Fresh session for error status update.
+            with get_db() as session:
+                Files.update_file_data_by_id(
+                    file.id,
+                    {"status": "failed"},
+                    db=session,
+                )
+                # Clear the hash so the file can be re-uploaded after fixing the issue
+                Files.update_file_hash_by_id(file.id, None, db=session)
 
             if "No pandoc was found" in str(e):
                 raise HTTPException(
@@ -2056,6 +2152,9 @@ async def process_web(
     request: Request,
     form_data: ProcessUrlForm,
     process: bool = Query(True, description="Whether to process and save the content"),
+    overwrite: bool = Query(
+        True, description="Whether to overwrite existing collection"
+    ),
     user=Depends(get_verified_user),
 ):
     try:
@@ -2075,7 +2174,8 @@ async def process_web(
                     request,
                     docs,
                     collection_name,
-                    overwrite=True,
+                    overwrite=overwrite,
+                    add=(not overwrite),
                     user=user,
                 )
             else:
@@ -2400,6 +2500,24 @@ def search_web(
             request.app.state.config.WEB_SEARCH_DOMAIN_FILTER_LIST,
             user=user,
         )
+    elif engine == "yandex":
+        return search_yandex(
+            request,
+            request.app.state.config.YANDEX_WEB_SEARCH_URL,
+            request.app.state.config.YANDEX_WEB_SEARCH_API_KEY,
+            request.app.state.config.YANDEX_WEB_SEARCH_CONFIG,
+            query,
+            request.app.state.config.WEB_SEARCH_RESULT_COUNT,
+            request.app.state.config.WEB_SEARCH_DOMAIN_FILTER_LIST,
+            user=user,
+        )
+    elif engine == "youcom":
+        return search_youcom(
+            request.app.state.config.YOUCOM_API_KEY,
+            query,
+            request.app.state.config.WEB_SEARCH_RESULT_COUNT,
+            request.app.state.config.WEB_SEARCH_DOMAIN_FILTER_LIST,
+        )
     else:
         raise Exception("No search engine API key found in environment variables")
 
@@ -2439,7 +2557,7 @@ async def process_web_search(
             # Limited concurrency with semaphore
             semaphore = asyncio.Semaphore(concurrent_limit)
 
-            async def search_with_limit(query):
+            async def search_query_with_semaphore(query):
                 async with semaphore:
                     return await run_in_threadpool(
                         search_web,
@@ -2449,7 +2567,9 @@ async def process_web_search(
                         user,
                     )
 
-            search_tasks = [search_with_limit(query) for query in form_data.queries]
+            search_tasks = [
+                search_query_with_semaphore(query) for query in form_data.queries
+            ]
         else:
             # Unlimited parallel execution (previous behavior)
             search_tasks = [
@@ -2574,6 +2694,34 @@ async def process_web_search(
         )
 
 
+def _validate_collection_access(collection_names: list[str], user) -> None:
+    """
+    Prevent users from querying collections they don't own.
+    Enforces ownership on user-memory-* and file-* collections.
+    Admins bypass this check.
+    """
+    if user.role == "admin":
+        return
+
+    for name in collection_names:
+        if name.startswith("user-memory-") and name != f"user-memory-{user.id}":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+            )
+        elif name.startswith("file-"):
+            file_id = name[len("file-") :]
+            if not has_access_to_file(
+                file_id=file_id,
+                access_type="read",
+                user=user,
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+                )
+
+
 class QueryDocForm(BaseModel):
     collection_name: str
     query: str
@@ -2581,6 +2729,8 @@ class QueryDocForm(BaseModel):
     k_reranker: Optional[int] = None
     r: Optional[float] = None
     hybrid: Optional[bool] = None
+    hybrid_bm25_weight: Optional[float] = None
+    reranking_model: Optional[str] = None
 
 
 @router.post("/query/doc")
@@ -2589,10 +2739,24 @@ async def query_doc_handler(
     form_data: QueryDocForm,
     user=Depends(get_verified_user),
 ):
+    _validate_collection_access([form_data.collection_name], user)
+
     try:
-        if request.app.state.config.ENABLE_RAG_HYBRID_SEARCH and (
-            form_data.hybrid is None or form_data.hybrid
-        ):
+        effective_hybrid = resolve_effective_hybrid(
+            form_data.hybrid,
+            request.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+        )
+        effective_reranking_model = resolve_effective_reranking_model(
+            form_data.reranking_model,
+            request.app.state.config.RAG_RERANKING_MODEL,
+            request.app.state.config.RAG_RERANKING_PRESET_MODELS,
+        )
+        reranking_function = build_request_reranking_function(
+            request,
+            effective_reranking_model,
+        )
+
+        if effective_hybrid:
             collection_results = {}
             collection_results[form_data.collection_name] = VECTOR_DB_CLIENT.get(
                 collection_name=form_data.collection_name
@@ -2607,11 +2771,11 @@ async def query_doc_handler(
                 k=form_data.k if form_data.k else request.app.state.config.TOP_K,
                 reranking_function=(
                     (
-                        lambda query, documents: request.app.state.RERANKING_FUNCTION(
+                        lambda query, documents: reranking_function(
                             query, documents, user=user
                         )
                     )
-                    if request.app.state.RERANKING_FUNCTION
+                    if reranking_function
                     else None
                 ),
                 k_reranker=form_data.k_reranker
@@ -2655,7 +2819,8 @@ class QueryCollectionsForm(BaseModel):
     hybrid: Optional[bool] = None
     hybrid_bm25_weight: Optional[float] = None
     enable_enriched_texts: Optional[bool] = None
-    global_top_k: Optional[bool] = True  # True: global top_k, False: per-source top_k
+    global_top_k: Optional[bool] = None
+    reranking_model: Optional[str] = None
 
 
 @router.post("/query/collection")
@@ -2664,10 +2829,24 @@ async def query_collection_handler(
     form_data: QueryCollectionsForm,
     user=Depends(get_verified_user),
 ):
+    _validate_collection_access(form_data.collection_names, user)
+
     try:
-        if request.app.state.config.ENABLE_RAG_HYBRID_SEARCH and (
-            form_data.hybrid is None or form_data.hybrid
-        ):
+        effective_hybrid = resolve_effective_hybrid(
+            form_data.hybrid,
+            request.app.state.config.ENABLE_RAG_HYBRID_SEARCH,
+        )
+        effective_reranking_model = resolve_effective_reranking_model(
+            form_data.reranking_model,
+            request.app.state.config.RAG_RERANKING_MODEL,
+            request.app.state.config.RAG_RERANKING_PRESET_MODELS,
+        )
+        reranking_function = build_request_reranking_function(
+            request,
+            effective_reranking_model,
+        )
+
+        if effective_hybrid:
             return await query_collection_with_hybrid_search(
                 collection_names=form_data.collection_names,
                 queries=[form_data.query],
@@ -2677,11 +2856,11 @@ async def query_collection_handler(
                 k=form_data.k if form_data.k else request.app.state.config.TOP_K,
                 reranking_function=(
                     (
-                        lambda query, documents: request.app.state.RERANKING_FUNCTION(
+                        lambda query, documents: reranking_function(
                             query, documents, user=user
                         )
                     )
-                    if request.app.state.RERANKING_FUNCTION
+                    if reranking_function
                     else None
                 ),
                 k_reranker=form_data.k_reranker
@@ -2701,7 +2880,11 @@ async def query_collection_handler(
                     if form_data.enable_enriched_texts is not None
                     else request.app.state.config.ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS
                 ),
-                global_top_k=form_data.global_top_k if form_data.global_top_k is not None else True,
+                global_top_k=(
+                    form_data.global_top_k
+                    if form_data.global_top_k is not None
+                    else True
+                ),
             )
         else:
             return await query_collection(
@@ -2711,7 +2894,6 @@ async def query_collection_handler(
                     query, prefix=prefix, user=user
                 ),
                 k=form_data.k if form_data.k else request.app.state.config.TOP_K,
-                global_top_k=form_data.global_top_k if form_data.global_top_k is not None else True,
             )
 
     except Exception as e:
@@ -2805,6 +2987,11 @@ if ENV == "dev":
 class BatchProcessFilesForm(BaseModel):
     files: List[FileModel]
     collection_name: str
+    bypass_file_collection_cache: bool = False
+    chunk_size: Optional[int] = None
+    chunk_overlap: Optional[int] = None
+    text_splitter: Optional[str] = None
+    enable_markdown_splitting: Optional[bool] = None
 
 
 class BatchProcessFilesResult(BaseModel):
@@ -2823,82 +3010,8 @@ async def process_files_batch(
     request: Request,
     form_data: BatchProcessFilesForm,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ) -> BatchProcessFilesResponse:
-    """
-    Process a batch of files and save them to the vector database.
-    """
-
-    collection_name = form_data.collection_name
-
-    file_results: List[BatchProcessFilesResult] = []
-    file_errors: List[BatchProcessFilesResult] = []
-    file_updates: List[FileUpdateForm] = []
-
-    # Prepare all documents first
-    all_docs: List[Document] = []
-
-    for file in form_data.files:
-        try:
-            text_content = file.data.get("content", "")
-            docs: List[Document] = [
-                Document(
-                    page_content=text_content.replace("<br/>", "\n"),
-                    metadata={
-                        **file.meta,
-                        "name": file.filename,
-                        "created_by": file.user_id,
-                        "file_id": file.id,
-                        "source": file.filename,
-                    },
-                )
-            ]
-
-            all_docs.extend(docs)
-
-            file_updates.append(
-                FileUpdateForm(
-                    hash=calculate_sha256_string(text_content),
-                    data={"content": text_content},
-                )
-            )
-            file_results.append(
-                BatchProcessFilesResult(file_id=file.id, status="prepared")
-            )
-
-        except Exception as e:
-            log.error(f"process_files_batch: Error processing file {file.id}: {str(e)}")
-            file_errors.append(
-                BatchProcessFilesResult(file_id=file.id, status="failed", error=str(e))
-            )
-
-    # Save all documents in one batch
-    if all_docs:
-        try:
-            await run_in_threadpool(
-                save_docs_to_vector_db,
-                request,
-                all_docs,
-                collection_name,
-                add=True,
-                user=user,
-            )
-
-            # Update all files with collection name
-            for file_update, file_result in zip(file_updates, file_results):
-                Files.update_file_by_id(
-                    id=file_result.file_id, form_data=file_update, db=db
-                )
-                file_result.status = "completed"
-
-        except Exception as e:
-            log.error(
-                f"process_files_batch: Error saving documents to vector DB: {str(e)}"
-            )
-            for file_result in file_results:
-                file_result.status = "failed"
-                file_errors.append(
-                    BatchProcessFilesResult(file_id=file_result.file_id, error=str(e))
-                )
-
-    return BatchProcessFilesResponse(results=file_results, errors=file_errors)
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Knowledge batch processing must reload raw docs per file; use the knowledge batch route instead.",
+    )
