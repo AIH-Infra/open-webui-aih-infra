@@ -9,12 +9,16 @@
 		currentChatPage,
 		temporaryChatEnabled
 	} from '$lib/stores';
-	import { tick, getContext, onMount, createEventDispatcher } from 'svelte';
+	import { tick, getContext, onMount, onDestroy, createEventDispatcher } from 'svelte';
 	const dispatch = createEventDispatcher();
 
 	import { toast } from 'svelte-sonner';
 	import { getChatList, updateChatById } from '$lib/apis/chats';
-	import { copyToClipboard, extractCurlyBraceWords } from '$lib/utils';
+	import {
+		copyToClipboard,
+		extractCurlyBraceWords,
+		cleanupTransientMessageUI
+	} from '$lib/utils';
 
 	import Message from './Messages/Message.svelte';
 	import Loader from '../common/Loader.svelte';
@@ -30,7 +34,7 @@
 	export let user = $_user;
 
 	export let prompt;
-	export let history = {};
+	export let history: any = {};
 	export let selectedModels;
 	export let atSelectedModel;
 
@@ -67,13 +71,17 @@
 
 		messagesLoading = true;
 		messagesCount += 20;
+		buildMessages();
 
 		await tick();
 
 		messagesLoading = false;
 	};
 
-	$: if (history.currentId) {
+	let pendingRebuild = null;
+	let lastCurrentId = null;
+
+	const buildMessages = () => {
 		let _messages = [];
 
 		let message = history.messages[history.currentId];
@@ -86,14 +94,42 @@
 			}
 			visitedMessageIds.add(message.id);
 
-			_messages.unshift({ ...message });
+			_messages.push(message);
 			message = message.parentId !== null ? history.messages[message.parentId] : null;
 		}
 
-		messages = _messages;
-	} else {
-		messages = [];
-	}
+		messages = _messages.reverse();
+	};
+
+	// Throttle message list rebuilds to once per animation frame during streaming.
+	// Structural changes (currentId change) always rebuild immediately.
+	const handleHistoryChange = (currentId, _messages) => {
+		if (!currentId) {
+			messages = [];
+			return;
+		}
+
+		const currentIdChanged = currentId !== lastCurrentId;
+		lastCurrentId = currentId;
+
+		if (currentIdChanged) {
+			cleanupTransientMessageUI();
+			// Structural change: new chat, navigation, new message — rebuild immediately
+			cancelAnimationFrame(pendingRebuild);
+			pendingRebuild = null;
+			buildMessages();
+		} else if (_messages) {
+			// Content update (streaming) — throttle to once per frame
+			if (!pendingRebuild) {
+				pendingRebuild = requestAnimationFrame(() => {
+					pendingRebuild = null;
+					buildMessages();
+				});
+			}
+		}
+	};
+
+	$: handleHistoryChange(history.currentId, history.messages);
 
 	$: if (autoScroll && bottomPadding) {
 		(async () => {
@@ -107,10 +143,19 @@
 		element.scrollTop = element.scrollHeight;
 	};
 
+	const syncHistory = async () => {
+		history = {
+			...history,
+			messages: {
+				...(history?.messages ?? {})
+			}
+		};
+		await tick();
+	};
+
 	const updateChat = async () => {
 		if (!$temporaryChatEnabled) {
-			history = history;
-			await tick();
+			await syncHistory();
 			await updateChatById(localStorage.token, chatId, {
 				history: history,
 				messages: messages
@@ -122,6 +167,7 @@
 	};
 
 	const gotoMessage = async (message, idx) => {
+		cleanupTransientMessageUI();
 		// Determine the correct sibling list (either parent's children or root messages)
 		let siblings;
 		if (message.parentId !== null) {
@@ -163,6 +209,7 @@
 	};
 
 	const showPreviousMessage = async (message) => {
+		cleanupTransientMessageUI();
 		if (message.parentId !== null) {
 			let messageId =
 				history.messages[message.parentId].childrenIds[
@@ -210,6 +257,7 @@
 	};
 
 	const showNextMessage = async (message) => {
+		cleanupTransientMessageUI();
 		if (message.parentId !== null) {
 			let messageId =
 				history.messages[message.parentId].childrenIds[
@@ -353,12 +401,17 @@
 		await chatActionHandler(chatId, actionId, message.model, message.id, event);
 	};
 
-	const saveMessage = async (messageId, message) => {
+	const syncMessage = async (messageId: string, message: any) => {
 		if (!history.messages?.[messageId]) {
 			return;
 		}
 
 		history.messages[messageId] = message;
+		await syncHistory();
+	};
+
+	const saveMessage = async (messageId, message) => {
+		await syncMessage(messageId, message);
 		await updateChat();
 	};
 
@@ -392,13 +445,12 @@
 			delete history.messages[id];
 		});
 
-		await tick();
-
-		showMessage({ id: parentMessageId });
-
-		// Update the chat
-		await updateChat();
+		showMessage({ id: parentMessageId }, false);
 	};
+
+	onDestroy(() => {
+		cancelAnimationFrame(pendingRebuild);
+	});
 
 	const triggerScroll = () => {
 		if (autoScroll) {
@@ -452,6 +504,7 @@
 								{deleteMessage}
 								{rateMessage}
 								{actionMessage}
+								{syncMessage}
 								{saveMessage}
 								{submitMessage}
 								{regenerateResponse}

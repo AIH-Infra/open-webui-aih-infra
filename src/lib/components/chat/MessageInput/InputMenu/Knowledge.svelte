@@ -4,7 +4,10 @@
 	import { decodeString } from '$lib/utils';
 	import { knowledge } from '$lib/stores';
 
-	import { getKnowledgeBases, searchKnowledgeFilesById } from '$lib/apis/knowledge';
+	import {
+		getKnowledgeBases,
+		searchKnowledgeFilesById
+	} from '$lib/apis/knowledge';
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import Database from '$lib/components/icons/Database.svelte';
@@ -86,6 +89,39 @@
 
 		selectedFileItemsLoading = false;
 		return res;
+	};
+
+	const getAllKnowledgeFilesById = async (id: string) => {
+		const items: any[] = [];
+		let total = 0;
+		let page = 1;
+
+		while (true) {
+			const res = await searchKnowledgeFilesById(
+				localStorage.token,
+				id,
+				null,
+				null,
+				null,
+				null,
+				page
+			);
+
+			const pageItems = res?.items ?? [];
+			total = res?.total ?? items.length;
+			items.push(...pageItems);
+
+			if (pageItems.length === 0 || items.length >= total) {
+				break;
+			}
+
+			page += 1;
+		}
+
+		return {
+			items,
+			total
+		};
 	};
 
 	let page = 1;
@@ -170,11 +206,42 @@
 					<button
 						class="w-full flex-1"
 						type="button"
-						on:click={() => {
-							onSelect({
-								type: 'collection',
-								...item
+						on:click={async () => {
+							// AIH-Infra: Fetch files for collection with debugging
+							console.log('[Knowledge] Fetching files for collection:', item.id, item.name);
+
+							const filesRes = await getAllKnowledgeFilesById(
+								item.id
+							).catch((err) => {
+								console.error('[Knowledge] API call failed:', err);
+								return null;
 							});
+
+							console.log('[Knowledge] API response:', filesRes);
+
+							if (filesRes) {
+								const files = filesRes.items.map(f => ({
+									...f,
+									enabled: true,
+									filename: f.name || f.filename
+								}));
+
+								console.log('[Knowledge] Mapped files:', files);
+
+								onSelect({
+									type: 'collection',
+									...item,
+									files: files,
+									allFilesEnabled: true,
+									boost: 1.0
+								});
+							} else {
+								onSelect({
+									type: 'collection',
+									...item,
+									boost: 1.0
+								});
+							}
 						}}
 						on:mousemove={() => {
 							selectedIdx = idx;
@@ -186,12 +253,16 @@
 						}}
 						data-selected={idx === selectedIdx}
 					>
-						<div class="  text-black dark:text-gray-100 flex items-center gap-1 shrink-0">
+						<div class="w-full text-left text-black dark:text-gray-100 flex items-center gap-1">
 							<Tooltip content={$i18n.t('Collection')} placement="top">
 								<Database className="size-4" />
 							</Tooltip>
 
-							<Tooltip content={item.description || decodeString(item?.name)} placement="top-start">
+							<Tooltip
+								content={item.description || decodeString(item?.name)}
+								placement="top-start"
+								className="flex flex-1 min-w-0"
+							>
 								<div class="line-clamp-1 flex-1 text-sm">
 									{decodeString(item?.name)}
 								</div>
