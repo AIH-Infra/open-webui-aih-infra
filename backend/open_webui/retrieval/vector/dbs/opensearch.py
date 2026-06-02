@@ -1,3 +1,7 @@
+"""
+NOTE: This vector database integration is community-supported and maintained on a best-effort basis.
+"""
+
 from opensearchpy import OpenSearch
 from opensearchpy.helpers import bulk
 from typing import Optional
@@ -211,7 +215,7 @@ class OpenSearchClient(VectorDBBase):
                 for item in batch
             ]
             bulk(self.client, actions)
-        self.client.indices.refresh(self._get_index_name(collection_name))
+        self.client.indices.refresh(index=self._get_index_name(collection_name))
 
     def upsert(self, collection_name: str, items: list[VectorItem]):
         self._create_index_if_not_exists(
@@ -234,7 +238,7 @@ class OpenSearchClient(VectorDBBase):
                 for item in batch
             ]
             bulk(self.client, actions)
-        self.client.indices.refresh(self._get_index_name(collection_name))
+        self.client.indices.refresh(index=self._get_index_name(collection_name))
 
     def delete(
         self,
@@ -263,7 +267,7 @@ class OpenSearchClient(VectorDBBase):
             self.client.delete_by_query(
                 index=self._get_index_name(collection_name), body=query_body
             )
-        self.client.indices.refresh(self._get_index_name(collection_name))
+        self.client.indices.refresh(index=self._get_index_name(collection_name))
 
     def reset(self):
         indices = self.client.indices.get(index=f"{self.index_prefix}_*")

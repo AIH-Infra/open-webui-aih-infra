@@ -1,3 +1,7 @@
+"""
+NOTE: This vector database integration is community-supported and maintained on a best-effort basis.
+"""
+
 from typing import Optional, List, Dict, Any, Union
 import logging
 import time  # for measuring elapsed time
@@ -32,7 +36,6 @@ from open_webui.config import (
     PINECONE_CLOUD,
 )
 from open_webui.retrieval.vector.utils import process_metadata
-
 
 NO_LIMIT = 10000  # Reasonable limit to avoid overwhelming the system
 BATCH_SIZE = 100  # Recommended batch size for Pinecone operations
