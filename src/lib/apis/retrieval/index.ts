@@ -54,6 +54,7 @@ type RAGConfigForm = {
 	PDF_EXTRACT_IMAGES?: boolean;
 	ENABLE_GOOGLE_DRIVE_INTEGRATION?: boolean;
 	ENABLE_ONEDRIVE_INTEGRATION?: boolean;
+	RAG_RERANKING_PRESET_MODELS?: string[];
 	chunk?: ChunkConfigForm;
 	content_extraction?: ContentExtractConfigForm;
 	web_loader_ssl_verification?: boolean;
@@ -447,19 +448,24 @@ export const queryCollection = async (
 	collection_names: string,
 	query: string,
 	k: number | null = null,
-	r: number | null = null,
-	global_top_k: boolean | null = null
+	ragParams: any = null
 ) => {
 	let error = null;
 
 	const body: any = {
 		collection_names: collection_names,
-		query: query
+		query: query,
+		k: k
 	};
 
-	if (k !== null) body.k = k;
-	if (r !== null) body.r = r;
-	if (global_top_k !== null) body.global_top_k = global_top_k;
+	if (ragParams) {
+		if (ragParams.hybrid !== undefined && ragParams.hybrid !== null) body.hybrid = ragParams.hybrid;
+		if (ragParams.k_reranker !== undefined && ragParams.k_reranker !== null) body.k_reranker = ragParams.k_reranker;
+		if (ragParams.relevance_threshold !== undefined && ragParams.relevance_threshold !== null) body.r = ragParams.relevance_threshold;
+		if (ragParams.hybrid_bm25_weight !== undefined && ragParams.hybrid_bm25_weight !== null) body.hybrid_bm25_weight = ragParams.hybrid_bm25_weight;
+		if (ragParams.global_top_k !== undefined) body.global_top_k = ragParams.global_top_k;
+		if (ragParams.reranking_model !== undefined && ragParams.reranking_model !== null) body.reranking_model = ragParams.reranking_model;
+	}
 
 	const res = await fetch(`${RETRIEVAL_API_BASE_URL}/query/collection`, {
 		method: 'POST',

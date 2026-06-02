@@ -4,25 +4,13 @@ export const createNewKnowledge = async (
 	token: string,
 	name: string,
 	description: string,
-	accessControl: null | object,
-	chunkSize: number | null = null,
-	chunkOverlap: number | null = null,
-	textSplitter: string | null = null,
-	enableMarkdownSplitting: boolean | null = null
+	accessGrants: object[],
+	chunkSize?: number,
+	chunkOverlap?: number,
+	textSplitter?: string,
+	enableMarkdownSplitting?: boolean
 ) => {
 	let error = null;
-
-	const body: any = {
-		name: name,
-		description: description,
-		access_control: accessControl
-	};
-
-	// Only include chunk parameters if they are provided
-	if (chunkSize !== null) body.chunk_size = chunkSize;
-	if (chunkOverlap !== null) body.chunk_overlap = chunkOverlap;
-	if (textSplitter !== null) body.text_splitter = textSplitter;
-	if (enableMarkdownSplitting !== null) body.enable_markdown_splitting = enableMarkdownSplitting;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/create`, {
 		method: 'POST',
@@ -31,7 +19,15 @@ export const createNewKnowledge = async (
 			'Content-Type': 'application/json',
 			authorization: `Bearer ${token}`
 		},
-		body: JSON.stringify(body)
+		body: JSON.stringify({
+			name: name,
+			description: description,
+			access_grants: accessGrants,
+			chunk_size: chunkSize,
+			chunk_overlap: chunkOverlap,
+			text_splitter: textSplitter,
+			enable_markdown_splitting: enableMarkdownSplitting
+		})
 	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();
@@ -260,7 +256,11 @@ type KnowledgeUpdateForm = {
 	name?: string;
 	description?: string;
 	data?: object;
-	access_control?: null | object;
+	access_grants?: object[];
+	chunk_size?: number | null;
+	chunk_overlap?: number | null;
+	text_splitter?: string | null;
+	enable_markdown_splitting?: boolean | null;
 };
 
 export const updateKnowledgeById = async (token: string, id: string, form: KnowledgeUpdateForm) => {
@@ -277,7 +277,11 @@ export const updateKnowledgeById = async (token: string, id: string, form: Knowl
 			name: form?.name ? form.name : undefined,
 			description: form?.description ? form.description : undefined,
 			data: form?.data ? form.data : undefined,
-			access_control: form.access_control
+			access_grants: form.access_grants,
+			chunk_size: form?.chunk_size,
+			chunk_overlap: form?.chunk_overlap,
+			text_splitter: form?.text_splitter,
+			enable_markdown_splitting: form?.enable_markdown_splitting
 		})
 	})
 		.then(async (res) => {
@@ -290,6 +294,39 @@ export const updateKnowledgeById = async (token: string, id: string, form: Knowl
 		.catch((err) => {
 			error = err.detail;
 
+			console.error(err);
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	return res;
+};
+
+export const updateKnowledgeAccessGrants = async (
+	token: string,
+	id: string,
+	accessGrants: any[]
+) => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_API_BASE_URL}/knowledge/${id}/access/update`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify({ access_grants: accessGrants })
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			error = err.detail;
 			console.error(err);
 			return null;
 		});
@@ -532,12 +569,17 @@ export const getKnowledgeChunks = async (
 ) => {
 	let error = null;
 
+	const searchParams = new URLSearchParams();
+	searchParams.append('limit', limit.toString());
+	searchParams.append('offset', offset.toString());
+
 	const res = await fetch(
-		`${WEBUI_API_BASE_URL}/knowledge/${id}/chunks?limit=${limit}&offset=${offset}`,
+		`${WEBUI_API_BASE_URL}/knowledge/${id}/chunks?${searchParams.toString()}`,
 		{
 			method: 'GET',
 			headers: {
 				Accept: 'application/json',
+				'Content-Type': 'application/json',
 				authorization: `Bearer ${token}`
 			}
 		}
