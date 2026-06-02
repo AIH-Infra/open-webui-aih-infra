@@ -7,8 +7,8 @@
 
 	import { onMount, tick } from 'svelte';
 
-	import { writable } from 'svelte/store';
-	import { models, showOverview, theme, user } from '$lib/stores';
+	import { writable, type Unsubscriber } from 'svelte/store';
+	import { models, theme, user } from '$lib/stores';
 
 	import '@xyflow/svelte/dist/style.css';
 
@@ -32,6 +32,7 @@
 	const edges = writable([]);
 
 	let layoutDirection = 'vertical';
+	let resizeFitScheduled = false;
 
 	const nodeTypes = {
 		custom: CustomNode
@@ -46,6 +47,10 @@
 	}
 
 	const focusNode = async () => {
+		if (!history?.currentId) {
+			return;
+		}
+
 		if (selectedMessageId === null) {
 			await fitView({ nodes: [{ id: history.currentId }] });
 		} else {
@@ -138,29 +143,41 @@
 		drawFlow(layoutDirection);
 	};
 
+	const scheduleFitCurrentNode = async () => {
+		if (!history?.currentId || resizeFitScheduled) {
+			return;
+		}
+
+		resizeFitScheduled = true;
+		await tick();
+		await fitView({ nodes: [{ id: history.currentId }] });
+		resizeFitScheduled = false;
+	};
+
 	onMount(() => {
 		drawFlow(layoutDirection);
 
-		nodesInitialized.subscribe(async (initialized) => {
-			if (initialized) {
-				await tick();
-				const res = await fitView({ nodes: [{ id: history.currentId }] });
-			}
-		});
+		const unsubscribers: Unsubscriber[] = [
+			nodesInitialized.subscribe(async (initialized) => {
+				if (initialized) {
+					await scheduleFitCurrentNode();
+				}
+			}),
+			width.subscribe((value) => {
+				if (value) {
+					scheduleFitCurrentNode();
+				}
+			}),
+			height.subscribe((value) => {
+				if (value) {
+					scheduleFitCurrentNode();
+				}
+			})
+		];
 
-		width.subscribe((value) => {
-			if (value) {
-				// fitView();
-				fitView({ nodes: [{ id: history.currentId }] });
-			}
-		});
-
-		height.subscribe((value) => {
-			if (value) {
-				// fitView();
-				fitView({ nodes: [{ id: history.currentId }] });
-			}
-		});
+		return () => {
+			unsubscribers.forEach((unsubscribe) => unsubscribe());
+		};
 	});
 
 	onDestroy(() => {
@@ -172,29 +189,6 @@
 </script>
 
 <div class="w-full h-full relative">
-	<div class=" absolute z-50 w-full flex justify-between dark:text-gray-100 px-4 py-3">
-		<div class="flex items-center gap-2.5">
-			<button
-				class="self-center p-0.5"
-				on:click={() => {
-					showOverview.set(false);
-				}}
-			>
-				<ArrowLeft className="size-3.5" />
-			</button>
-			<div class=" text-lg font-medium self-center font-primary">{$i18n.t('Chat Overview')}</div>
-		</div>
-		<button
-			class="self-center p-0.5"
-			on:click={() => {
-				onClose();
-				showOverview.set(false);
-			}}
-		>
-			<XMark className="size-3.5" />
-		</button>
-	</div>
-
 	{#if $nodes.length > 0}
 		<Flow
 			{nodes}
