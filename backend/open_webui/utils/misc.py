@@ -91,14 +91,22 @@ def get_message_list(messages_map, message_id):
 
     # Reconstruct the chain by following the parentId links
     message_list = []
+    visited_message_ids = set()
 
     while current_message:
-        message_list.insert(
-            0, current_message
-        )  # Insert the message at the beginning of the list
+        message_id = current_message.get("id")
+        if message_id in visited_message_ids:
+            # Cycle detected, break to prevent infinite loop
+            break
+
+        if message_id is not None:
+            visited_message_ids.add(message_id)
+
+        message_list.append(current_message)
         parent_id = current_message.get("parentId")  # Use .get() for safety
         current_message = messages_map.get(parent_id) if parent_id else None
 
+    message_list.reverse()
     return message_list
 
 
@@ -109,6 +117,181 @@ def get_messages_content(messages: list[dict]) -> str:
             for message in messages
         ]
     )
+
+
+def _safe_json_loads(value):
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _truncate_replay_text(value, limit: int = 280) -> str:
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}..."
+
+
+def _extract_function_output_text(output_parts) -> str:
+    text_parts = []
+    for part in output_parts or []:
+        if not isinstance(part, dict):
+            continue
+        if "text" in part:
+            part_text = part.get("text", "")
+            text_parts.append(part_text if isinstance(part_text, str) else str(part_text))
+    return "".join(text_parts)
+
+
+def _summarize_query_knowledge_files_for_replay(result, arguments: dict) -> str:
+    chunks = result if isinstance(result, list) else []
+    unique_sources = []
+    seen_sources = set()
+    top_chunks = []
+
+    for chunk in chunks[:3]:
+        if not isinstance(chunk, dict):
+            continue
+        source_name = chunk.get("source") or chunk.get("file_id") or chunk.get("note_id")
+        if source_name and source_name not in seen_sources:
+            seen_sources.add(source_name)
+            unique_sources.append(source_name)
+        top_chunks.append(
+            {
+                "source": chunk.get("source"),
+                "file_id": chunk.get("file_id"),
+                "note_id": chunk.get("note_id"),
+                "distance": chunk.get("distance"),
+                "excerpt": _truncate_replay_text(chunk.get("content", "")),
+            }
+        )
+
+    payload = {
+        "tool_name": "query_knowledge_files",
+        "query": arguments.get("query"),
+        "knowledge_ids": arguments.get("knowledge_ids"),
+        "result_summary": {
+            "chunk_count": len(chunks),
+            "source_count": len(
+                {
+                    chunk.get("file_id") or chunk.get("note_id") or chunk.get("source")
+                    for chunk in chunks
+                    if isinstance(chunk, dict)
+                }
+            ),
+            "top_sources": unique_sources[:5],
+        },
+        "top_chunks": top_chunks,
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _summarize_file_view_for_replay(tool_name: str, result, arguments: dict) -> str:
+    result_dict = result if isinstance(result, dict) else {}
+    content = result_dict.get("content", "")
+    payload = {
+        "tool_name": tool_name,
+        "file_id": result_dict.get("id") or arguments.get("file_id"),
+        "filename": result_dict.get("filename"),
+        "knowledge_id": result_dict.get("knowledge_id"),
+        "knowledge_name": result_dict.get("knowledge_name"),
+        "content_length": len(content) if isinstance(content, str) else None,
+        "excerpt": _truncate_replay_text(content),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _summarize_search_web_for_replay(result, arguments: dict) -> str:
+    items = result if isinstance(result, list) else []
+    payload = {
+        "tool_name": "search_web",
+        "query": arguments.get("query"),
+        "results": [
+            {
+                "title": item.get("title"),
+                "link": item.get("link"),
+                "snippet": _truncate_replay_text(item.get("snippet", ""), 180),
+            }
+            for item in items[:5]
+            if isinstance(item, dict)
+        ],
+        "result_count": len(items),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _summarize_fetch_url_for_replay(result, arguments: dict) -> str:
+    if isinstance(result, dict):
+        content = result.get("content") or result.get("text") or json.dumps(
+            result, ensure_ascii=False
+        )
+    else:
+        content = result if isinstance(result, str) else str(result)
+    payload = {
+        "tool_name": "fetch_url",
+        "url": arguments.get("url"),
+        "content_length": len(content),
+        "excerpt": _truncate_replay_text(content),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def normalize_output_for_replay(output: list) -> list:
+    if not output or not isinstance(output, list):
+        return []
+
+    function_calls = {}
+    normalized_output = []
+
+    for item in output:
+        if not isinstance(item, dict):
+            normalized_output.append(item)
+            continue
+
+        item_copy = dict(item)
+        if item_copy.get("type") == "function_call":
+            function_calls[item_copy.get("call_id", "")] = item_copy
+            normalized_output.append(item_copy)
+            continue
+
+        if item_copy.get("type") != "function_call_output":
+            normalized_output.append(item_copy)
+            continue
+
+        function_call = function_calls.get(item_copy.get("call_id", ""), {})
+        tool_name = function_call.get("name", "")
+        arguments = _safe_json_loads(function_call.get("arguments", {})) or {}
+        output_text = _extract_function_output_text(item_copy.get("output", []))
+        parsed_result = _safe_json_loads(output_text)
+
+        summary_text = None
+        if tool_name == "query_knowledge_files":
+            summary_text = _summarize_query_knowledge_files_for_replay(
+                parsed_result, arguments
+            )
+        elif tool_name in {"view_knowledge_file", "view_file"}:
+            summary_text = _summarize_file_view_for_replay(
+                tool_name, parsed_result, arguments
+            )
+        elif tool_name == "search_web":
+            summary_text = _summarize_search_web_for_replay(parsed_result, arguments)
+        elif tool_name == "fetch_url":
+            summary_text = _summarize_fetch_url_for_replay(parsed_result, arguments)
+
+        if summary_text is not None:
+            item_copy["output"] = [{"type": "input_text", "text": summary_text}]
+
+        normalized_output.append(item_copy)
+
+    return normalized_output
 
 
 def get_last_user_message_item(messages: list[dict]) -> Optional[dict]:
@@ -128,11 +311,168 @@ def get_content_from_message(message: dict) -> Optional[str]:
     return None
 
 
+def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
+    """
+    Convert OR-aligned output items to OpenAI Chat Completion-format messages.
+
+    This reconstructs the full conversation from the stored Responses API-native
+    output items, including assistant messages with tool_calls arrays and tool
+    role messages.
+
+    Args:
+        output: List of OR-aligned output items (Responses API format).
+        raw: If True, include reasoning blocks (with original tags) and code
+             interpreter blocks for LLM re-processing follow-ups.
+    """
+    if not output or not isinstance(output, list):
+        return []
+
+    messages = []
+    pending_tool_calls = []
+    pending_content = []
+
+    def flush_pending():
+        nonlocal pending_content, pending_tool_calls
+        if pending_content or pending_tool_calls:
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "\n".join(pending_content) if pending_content else "",
+                    **(
+                        {"tool_calls": pending_tool_calls} if pending_tool_calls else {}
+                    ),
+                }
+            )
+            pending_content = []
+            pending_tool_calls = []
+
+    for item in normalize_output_for_replay(output):
+        item_type = item.get("type", "")
+
+        if item_type == "message":
+            # Extract text from output_text content parts
+            content_parts = item.get("content", [])
+            text = ""
+            for part in content_parts:
+                if part.get("type") == "output_text":
+                    text += part.get("text", "")
+            if text:
+                pending_content.append(text)
+
+        elif item_type == "function_call":
+            # Collect tool calls to batch into assistant message
+            arguments = item.get("arguments", "{}")
+            # Ensure arguments is always a JSON string
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments)
+            pending_tool_calls.append(
+                {
+                    "id": item.get("call_id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": arguments,
+                    },
+                }
+            )
+
+        elif item_type == "function_call_output":
+            # Flush any pending content/tool_calls before adding tool result
+            flush_pending()
+
+            # Extract text from output content parts
+            output_parts = item.get("output", [])
+            content = ""
+            for part in output_parts:
+                if part.get("type") == "input_text":
+                    output_text = part.get("text", "")
+                    content += (
+                        str(output_text)
+                        if not isinstance(output_text, str)
+                        else output_text
+                    )
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.get("call_id", ""),
+                    "content": content,
+                }
+            )
+
+        elif item_type == "reasoning":
+            if raw:
+                # Include reasoning with original tags for LLM re-processing
+                reasoning_text = ""
+                source_list = item.get("summary", []) or item.get("content", [])
+                for part in source_list:
+                    if part.get("type") == "output_text":
+                        reasoning_text += part.get("text", "")
+                    elif "text" in part:
+                        reasoning_text += part.get("text", "")
+
+                if reasoning_text:
+                    start_tag = item.get("start_tag", "<think>")
+                    end_tag = item.get("end_tag", "</think>")
+                    pending_content.append(f"{start_tag}{reasoning_text}{end_tag}")
+            # else: skip reasoning blocks for normal LLM messages
+
+        elif item_type == "open_webui:code_interpreter":
+            # Always include code interpreter content so the LLM knows
+            # the code was already executed and doesn't retry.
+            code = item.get("code", "")
+            code_output = item.get("output", "")
+
+            if code:
+                pending_content.append(
+                    f"<code_interpreter>\n{code}\n</code_interpreter>"
+                )
+
+            if code_output:
+                if isinstance(code_output, dict):
+                    stdout = code_output.get("stdout", "")
+                    result = code_output.get("result", "")
+                    output_text = stdout or result
+                else:
+                    output_text = str(code_output)
+                if output_text:
+                    pending_content.append(
+                        f"<code_interpreter_output>\n{output_text}\n</code_interpreter_output>"
+                    )
+
+        elif item_type.startswith("open_webui:"):
+            # Skip other extension types
+            pass
+
+    # Flush remaining content/tool_calls
+    flush_pending()
+
+    return messages
+
+
 def get_last_user_message(messages: list[dict]) -> Optional[str]:
     message = get_last_user_message_item(messages)
     if message is None:
         return None
     return get_content_from_message(message)
+
+
+def set_last_user_message_content(content: str, messages: list[dict]) -> list[dict]:
+    """
+    Replace the text content of the last user message in-place.
+    Handles both plain-string and list-of-parts content formats.
+    """
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            if isinstance(message.get("content"), list):
+                for item in message["content"]:
+                    if item.get("type") == "text":
+                        item["text"] = content
+                        break
+            else:
+                message["content"] = content
+            break
+    return messages
 
 
 def get_last_assistant_message_item(messages: list[dict]) -> Optional[dict]:
@@ -313,7 +653,7 @@ def openai_chat_completion_message_template(
             **({"tool_calls": tool_calls} if tool_calls else {}),
         }
 
-    template["choices"][0]["finish_reason"] = "stop"
+    template["choices"][0]["finish_reason"] = "tool_calls" if tool_calls else "stop"
 
     if usage:
         template["usage"] = usage
@@ -399,6 +739,53 @@ def sanitize_data_for_db(obj):
     elif isinstance(obj, list):
         return [sanitize_data_for_db(v) for v in obj]
     return obj
+
+
+def sanitize_metadata(metadata: dict) -> dict:
+    """
+    Return a JSON-safe copy of a metadata dict for database storage.
+
+    The middleware metadata accumulates non-serializable Python objects
+    (e.g. callable tool functions, MCP client instances) that cause
+    PostgreSQL JSON inserts to fail.  This helper strips those out while
+    preserving the primitive data needed for file-to-chat linking.
+    """
+    if not isinstance(metadata, dict):
+        return metadata
+
+    def _sanitize(obj):
+        if isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+        if isinstance(obj, dict):
+            return {
+                k: _sanitize(v)
+                for k, v in obj.items()
+                if not callable(v) and _is_serializable(v)
+            }
+        if isinstance(obj, list):
+            return [
+                _sanitize(v) for v in obj if not callable(v) and _is_serializable(v)
+            ]
+        if callable(obj):
+            return None
+        # Last resort: try to see if it's serializable
+        try:
+            json.dumps(obj)
+            return obj
+        except (TypeError, ValueError):
+            return None
+
+    def _is_serializable(obj):
+        """Quick check whether a value can survive JSON serialization."""
+        if isinstance(obj, (str, int, float, bool, type(None), dict, list)):
+            return True
+        try:
+            json.dumps(obj)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    return _sanitize(metadata)
 
 
 def extract_folders_after_data_docs(path):
@@ -648,6 +1035,31 @@ def extract_urls(text: str) -> list[str]:
         r"(https?://[^\s]+)", re.IGNORECASE
     )  # Matches http and https URLs
     return url_pattern.findall(text)
+
+
+async def cleanup_response(
+    response: Optional[aiohttp.ClientResponse],
+    session: Optional[aiohttp.ClientSession],
+):
+    if response:
+        response.close()
+    if session:
+        await session.close()
+
+
+async def stream_wrapper(response, session, content_handler=None):
+    """
+    Wrap a stream to ensure cleanup happens even if streaming is interrupted.
+    This is more reliable than BackgroundTask which may not run if client disconnects.
+    """
+    try:
+        stream = (
+            content_handler(response.content) if content_handler else response.content
+        )
+        async for chunk in stream:
+            yield chunk
+    finally:
+        await cleanup_response(response, session)
 
 
 def stream_chunks_handler(stream: aiohttp.StreamReader):
