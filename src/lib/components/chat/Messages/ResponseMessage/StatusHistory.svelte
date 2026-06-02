@@ -16,13 +16,17 @@
 
 	let history = [];
 	let status = null;
+	$: normalizedStatusHistory = Array.isArray(statusHistory) ? statusHistory : [];
 
 	$: if (history && history.length > 0) {
 		status = history.at(-1);
 	}
 
-	$: if (JSON.stringify(statusHistory) !== JSON.stringify(history)) {
-		history = statusHistory;
+	$: if (
+		normalizedStatusHistory.length !== history.length ||
+		JSON.stringify(normalizedStatusHistory) !== JSON.stringify(history)
+	) {
+		history = normalizedStatusHistory;
 	}
 </script>
 
@@ -31,6 +35,8 @@
 		<div class="text-sm flex flex-col w-full">
 			<button
 				class="w-full"
+				aria-label={$i18n.t('Toggle status history')}
+				aria-expanded={showHistory}
 				on:click={() => {
 					showHistory = !showHistory;
 				}}

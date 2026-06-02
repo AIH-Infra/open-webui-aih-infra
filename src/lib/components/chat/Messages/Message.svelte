@@ -28,6 +28,7 @@
 	export let updateChat;
 
 	export let editMessage;
+	export let syncMessage;
 	export let saveMessage;
 	export let deleteMessage;
 	export let rateMessage;
@@ -87,6 +88,7 @@
 				{showNextMessage}
 				{updateChat}
 				{editMessage}
+				{syncMessage}
 				{saveMessage}
 				{rateMessage}
 				{actionMessage}
@@ -110,6 +112,7 @@
 					{setInputText}
 					{updateChat}
 					{editMessage}
+					{syncMessage}
 					{saveMessage}
 					{rateMessage}
 					{actionMessage}

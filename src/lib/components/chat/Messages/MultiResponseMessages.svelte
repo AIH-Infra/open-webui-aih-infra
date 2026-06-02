@@ -34,6 +34,7 @@
 	export let setInputText: Function = () => {};
 	export let updateChat: Function;
 	export let editMessage: Function;
+	export let syncMessage: Function;
 	export let saveMessage: Function;
 	export let rateMessage: Function;
 	export let actionMessage: Function;
@@ -60,10 +61,15 @@
 
 	let selectedModelIdx = null;
 
-	let message = JSON.parse(JSON.stringify(history.messages[messageId]));
+	let message = structuredClone(history.messages[messageId]);
 	$: if (history.messages) {
-		if (JSON.stringify(message) !== JSON.stringify(history.messages[messageId])) {
-			message = JSON.parse(JSON.stringify(history.messages[messageId]));
+		const source = history.messages[messageId];
+		if (source) {
+			if (message.content !== source.content || message.done !== source.done) {
+				message = structuredClone(source);
+			} else if (JSON.stringify(message) !== JSON.stringify(source)) {
+				message = structuredClone(source);
+			}
 		}
 	}
 
@@ -248,6 +254,9 @@
 					<div class=" flex w-full mb-4.5 border-b border-gray-200 dark:border-gray-850">
 						<div
 							class="flex gap-2 scrollbar-none overflow-x-auto w-fit text-center font-medium bg-transparent pt-1 text-sm"
+							on:wheel|preventDefault={(e) => {
+								e.currentTarget.scrollLeft += e.deltaY;
+							}}
 						>
 							{#each Object.keys(groupedMessageIds) as modelIdx}
 								{#if groupedMessageIdsIdx[modelIdx] !== undefined && (groupedMessageIds[modelIdx]?.messageIds ?? []).length > 0}
@@ -298,6 +307,7 @@
 									{setInputText}
 									{updateChat}
 									{editMessage}
+									{syncMessage}
 									{saveMessage}
 									{rateMessage}
 									{deleteMessage}
@@ -354,6 +364,7 @@
 										{setInputText}
 										{updateChat}
 										{editMessage}
+										{syncMessage}
 										{saveMessage}
 										{rateMessage}
 										{deleteMessage}

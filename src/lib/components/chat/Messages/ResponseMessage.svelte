@@ -12,7 +12,7 @@
 	const dispatch = createEventDispatcher();
 
 	import { createNewFeedback, getFeedbackById, updateFeedbackById } from '$lib/apis/evaluations';
-	import { getChatById } from '$lib/apis/chats';
+	import { getChatById, getChatMessageDetailById } from '$lib/apis/chats';
 	import { generateTags } from '$lib/apis';
 
 	import {
@@ -62,11 +62,31 @@
 	import RegenerateMenu from './ResponseMessage/RegenerateMenu.svelte';
 	import StatusHistory from './ResponseMessage/StatusHistory.svelte';
 	import FullHeightIframe from '$lib/components/common/FullHeightIframe.svelte';
+	import {
+		buildEvidenceExport,
+		buildTraceExport,
+		downloadExport,
+		formatRagSummary,
+		renderEvidenceMarkdown,
+		renderTraceMarkdown
+	} from '$lib/utils/chat-export';
+
+	interface RAGSnapshot {
+		rag_mode?: string;
+		rag?: Record<string, unknown>;
+		agent_rag_config?: Record<string, unknown>;
+		embedding_model?: string | null;
+		reranking_model?: string | null;
+	}
 
 	interface MessageType {
 		id: string;
 		model: string;
+		modelName?: string;
+		parentId?: string | null;
+		ragSnapshot?: RAGSnapshot;
 		content: string;
+		feedbackId?: string;
 		files?: { type: string; url: string }[];
 		timestamp: number;
 		role: string;
@@ -112,6 +132,10 @@
 			usage?: unknown;
 		};
 		annotation?: { type: string; rating: number };
+		output?: any[];
+		usage?: Record<string, unknown> | null;
+		embeds?: string[];
+		childrenIds?: string[];
 	}
 
 	export let chatId = '';
@@ -119,11 +143,140 @@
 	export let messageId;
 	export let selectedModels = [];
 
-	let message: MessageType = JSON.parse(JSON.stringify(history.messages[messageId]));
-	$: if (history.messages) {
-		if (JSON.stringify(message) !== JSON.stringify(history.messages[messageId])) {
-			message = JSON.parse(JSON.stringify(history.messages[messageId]));
+	let message: MessageType = structuredClone(history.messages[messageId]);
+	let messageDetail: Partial<MessageType> | null = null;
+	let detailLoadedForMessageId: string | null = null;
+	let detailFetchInFlight = false;
+
+	const getSourceKey = (source: any) => {
+		const sourceInfo = source?.source ?? {};
+		const metadata = Array.isArray(source?.metadata) ? source.metadata : [];
+		return (
+			sourceInfo?.id ??
+			sourceInfo?.url ??
+			metadata.find((item: any) => item?.source)?.source ??
+			sourceInfo?.name ??
+			JSON.stringify(source)
+		);
+	};
+
+	const mergeSources = (existing: any[] = [], incoming: any[] = []) => {
+		const merged: any[] = [];
+		const seen = new Map<string, number>();
+
+		for (const source of [...existing, ...incoming]) {
+			if (!source || Object.keys(source).length === 0) {
+				continue;
+			}
+
+			const key = getSourceKey(source);
+			const existingIndex = seen.get(key);
+			if (existingIndex === undefined) {
+				merged.push({
+					...source,
+					document: [...(source?.document ?? [])],
+					metadata: [...(source?.metadata ?? [])],
+					distances: [...(source?.distances ?? [])]
+				});
+				seen.set(key, merged.length - 1);
+				continue;
+			}
+
+			const current = merged[existingIndex];
+			current.document = [...(current?.document ?? []), ...(source?.document ?? [])];
+			current.metadata = [...(current?.metadata ?? []), ...(source?.metadata ?? [])];
+			current.distances = [...(current?.distances ?? []), ...(source?.distances ?? [])];
 		}
+
+		return merged;
+	};
+
+	const mergeMessageDetail = (baseMessage: MessageType, detail: Partial<MessageType>) => ({
+		...baseMessage,
+		...detail,
+		ragSnapshot: detail?.ragSnapshot ?? baseMessage?.ragSnapshot,
+		modelName: detail?.modelName ?? baseMessage?.modelName,
+		childrenIds: detail?.childrenIds ?? baseMessage?.childrenIds,
+		statusHistory: Array.isArray(detail?.statusHistory)
+			? [...detail.statusHistory]
+			: Array.isArray(baseMessage?.statusHistory)
+				? [...baseMessage.statusHistory]
+				: [],
+		sources:
+			detail?.sources !== undefined
+				? mergeSources([], (detail?.sources as any[]) ?? [])
+				: mergeSources([], baseMessage?.sources ?? [])
+	});
+
+	$: if (history.messages) {
+		const source = history.messages[messageId];
+		if (source) {
+			const currentDetail =
+				messageDetail && detailLoadedForMessageId === source.id ? messageDetail : null;
+			const mergedSource = currentDetail
+				? mergeMessageDetail(structuredClone(source), currentDetail)
+				: structuredClone(source);
+			if (message.content !== mergedSource.content || message.done !== mergedSource.done) {
+				message = mergedSource;
+			} else if (JSON.stringify(message) !== JSON.stringify(mergedSource)) {
+				message = mergedSource;
+			}
+		}
+	}
+
+	$: if (messageDetail && detailLoadedForMessageId && detailLoadedForMessageId !== messageId) {
+		messageDetail = null;
+		detailLoadedForMessageId = null;
+	}
+
+	const loadMessageDetail = async (targetMessageId: string) => {
+		if (
+			!chatId ||
+			!targetMessageId ||
+			detailFetchInFlight ||
+			detailLoadedForMessageId === targetMessageId
+		) {
+			return;
+		}
+
+		detailFetchInFlight = true;
+		try {
+			const detail = await getChatMessageDetailById(localStorage.token, chatId, targetMessageId);
+			if (detail && message.id === targetMessageId) {
+				const mergedMessage = mergeMessageDetail(message, detail);
+				messageDetail = detail;
+				message = mergedMessage;
+				detailLoadedForMessageId = targetMessageId;
+				await syncMessage?.(targetMessageId, mergedMessage);
+			}
+		} catch (error) {
+			console.debug('Failed to load chat message detail', error);
+		} finally {
+			detailFetchInFlight = false;
+		}
+	};
+
+	const needsMessageDetail = (targetMessage: MessageType | null | undefined) => {
+		if (!targetMessage?.done || !targetMessage?.id) {
+			return false;
+		}
+
+		const hasSources = Array.isArray(targetMessage?.sources) && targetMessage.sources.length > 0;
+		const hasUsage = !!targetMessage?.usage;
+		const hasOutput = Array.isArray(targetMessage?.output) && targetMessage.output.length > 0;
+		const hasStatusHistory =
+			Array.isArray(targetMessage?.statusHistory) && targetMessage.statusHistory.length > 0;
+
+		return !(hasSources || hasUsage || hasOutput || hasStatusHistory);
+	};
+
+	$: if (
+		message?.id &&
+		needsMessageDetail(message) &&
+		!detailFetchInFlight &&
+		detailLoadedForMessageId !== message.id
+	) {
+		void loadMessageDetail(message.id);
 	}
 
 	export let siblings;
@@ -135,6 +288,7 @@
 
 	export let updateChat: Function;
 	export let editMessage: Function;
+	export let syncMessage: Function;
 	export let saveMessage: Function;
 	export let rateMessage: Function;
 	export let actionMessage: Function;
@@ -164,9 +318,43 @@
 	let editedContent = '';
 	let editTextAreaElement: HTMLTextAreaElement;
 
+	let exportChooser: 'evidence' | 'trace' | null = null;
+	let exportFormat: 'json' | 'markdown' = 'json';
+	let ragSummary: string | null = null;
+	let questionMessage: MessageType | null = null;
 	let messageIndexEdit = false;
-
 	let speaking = false;
+
+	$: ragSummary = formatRagSummary(message?.ragSnapshot);
+	$: questionMessage = message?.parentId ? history?.messages?.[message.parentId] : null;
+
+	const closeTransientUI = () => {
+		exportChooser = null;
+	};
+
+	const toggleExportFormat = (format: 'json' | 'markdown') => {
+		exportFormat = format;
+	};
+
+	const runExport = (scope: 'evidence' | 'trace') => {
+		const exportMessage = message;
+		const bundle =
+			scope === 'evidence'
+				? buildEvidenceExport({ chatId, message: exportMessage, questionMessage })
+				: buildTraceExport({ chatId, message: exportMessage, questionMessage });
+
+		downloadExport({
+			bundle,
+			renderer: scope === 'evidence' ? renderEvidenceMarkdown : renderTraceMarkdown,
+			chatId,
+			message: exportMessage,
+			suffix: scope === 'evidence' ? 'answer-evidence' : 'answer-trace',
+			format: exportFormat
+		});
+
+		exportChooser = null;
+	};
+
 	let speakingIdx: number | undefined;
 
 	let loadingSpeech = false;
@@ -365,8 +553,13 @@
 
 		await tick();
 
+		const messagesContainer = document.getElementById('messages-container');
+		const savedScrollTop = messagesContainer?.scrollTop;
+
 		editTextAreaElement.style.height = '';
 		editTextAreaElement.style.height = `${editTextAreaElement.scrollHeight}px`;
+
+		if (messagesContainer) messagesContainer.scrollTop = savedScrollTop;
 	};
 
 	const editMessageConfirmHandler = async () => {
@@ -420,17 +613,19 @@
 
 		const messages = createMessagesList(history, message.id);
 
+		const parentMessage = message.parentId ? history.messages[message.parentId] : null;
+
 		let feedbackItem = {
 			type: 'rating',
 			data: {
 				...(updatedMessage?.annotation ? updatedMessage.annotation : {}),
 				model_id: message?.selectedModelId ?? message.model,
-				...(history.messages[message.parentId].childrenIds.length > 1
+				...(parentMessage && parentMessage.childrenIds.length > 1
 					? {
-							sibling_model_ids: history.messages[message.parentId].childrenIds
-								.filter((id) => id !== message.id)
-								.map((id) => history.messages[id]?.selectedModelId ?? history.messages[id].model)
-						}
+							sibling_model_ids: parentMessage.childrenIds
+							.filter((id) => id !== message.id)
+							.map((id) => history.messages[id]?.selectedModelId ?? history.messages[id].model)
+					}
 					: {})
 			},
 			meta: {
@@ -607,6 +802,7 @@
 		class=" flex w-full message-{message.id}"
 		id="message-{message.id}"
 		dir={$settings.chatDirection}
+		style="scroll-margin-top: 3rem;"
 	>
 		<div class={`shrink-0 ltr:mr-3 rtl:ml-3 hidden @lg:flex mt-1 `}>
 			<ProfileImage
@@ -622,6 +818,12 @@
 						{model?.name ?? message.model}
 					</span>
 				</Tooltip>
+
+				{#if ragSummary}
+					<div class="self-center text-xs font-medium ml-2 text-gray-500 dark:text-gray-400 line-clamp-1">
+						{ragSummary}
+					</div>
+				{/if}
 
 				{#if message.timestamp}
 					<div
@@ -646,7 +848,7 @@
 				<div class="chat-{message.role} w-full min-w-full markdown-prose">
 					<div>
 						{#if model?.info?.meta?.capabilities?.status_updates ?? true}
-							<StatusHistory statusHistory={message?.statusHistory} />
+							<StatusHistory statusHistory={message?.statusHistory ?? []} />
 						{/if}
 
 						{#if message?.files && message.files?.filter((f) => f.type === 'image').length > 0}
@@ -674,7 +876,10 @@
 						{/if}
 
 						{#if message?.embeds && message.embeds.length > 0}
-							<div class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap">
+							<div
+								class="my-1 w-full flex overflow-x-auto gap-2 flex-wrap"
+								id={`${message.id}-embeds-container`}
+							>
 								{#each message.embeds as embed, idx}
 									<div class="my-2 w-full" id={`${message.id}-embeds-${idx}`}>
 										<FullHeightIframe
@@ -697,8 +902,13 @@
 									class=" bg-transparent outline-hidden w-full resize-none"
 									bind:value={editedContent}
 									on:input={(e) => {
+										const messagesContainer = document.getElementById('messages-container');
+										const savedScrollTop = messagesContainer?.scrollTop;
+
 										e.target.style.height = '';
 										e.target.style.height = `${e.target.scrollHeight}px`;
+
+										if (messagesContainer) messagesContainer.scrollTop = savedScrollTop;
 									}}
 									on:keydown={(e) => {
 										if (e.key === 'Escape') {
@@ -1076,6 +1286,39 @@
 									</Tooltip>
 								{/if}
 
+								<Tooltip content={$i18n.t('Export Evidence')} placement="bottom">
+									<button
+										aria-label={$i18n.t('Export Evidence')}
+										class="{isLastMessage || ($settings?.highContrastMode ?? false) ? 'visible' : 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+										on:click={() => {
+											const nextChooser = exportChooser === 'evidence' ? null : 'evidence';
+											closeTransientUI();
+											exportChooser = nextChooser;
+										}}
+									>
+										<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.3" stroke="currentColor" class="w-4 h-4">
+											<path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v2.625a2.625 2.625 0 0 1-2.625 2.625h-9.75A2.625 2.625 0 0 1 4.5 16.875V14.25m7.5-9.75v11.25m0 0 3.75-3.75M12 15.75l-3.75-3.75" />
+										</svg>
+									</button>
+								</Tooltip>
+
+								<Tooltip content={$i18n.t('Export Answer Trace')} placement="bottom">
+									<button
+										aria-label={$i18n.t('Export Answer Trace')}
+										class="{isLastMessage || ($settings?.highContrastMode ?? false) ? 'visible' : 'invisible group-hover:visible'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+										on:click={() => {
+											const nextChooser = exportChooser === 'trace' ? null : 'trace';
+											closeTransientUI();
+											exportChooser = nextChooser;
+										}}
+									>
+										<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2.3" stroke="currentColor" class="w-4 h-4">
+											<path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75 11.25 15 15 9.75m6 2.25a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+										</svg>
+									</button>
+								</Tooltip>
+
+
 								{#if message.usage}
 									<Tooltip
 										content={message.usage
@@ -1397,7 +1640,7 @@
 													<div class="size-4">
 														<img
 															src={action.icon}
-															class="w-4 h-4 {action.icon.includes('svg')
+															class="w-4 h-4 {action.icon.includes('data:image/svg')
 																? 'dark:invert-[80%]'
 																: ''}"
 															style="fill: currentColor;"
@@ -1414,6 +1657,20 @@
 							{/if}
 						{/if}
 					</div>
+
+					{#if exportChooser}
+						<div class="mt-1 px-3 py-2 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 text-xs flex items-center gap-3 w-fit">
+							<label class="flex items-center gap-1 cursor-pointer">
+								<input type="radio" name="answer-export-format-{message.id}" checked={exportFormat === 'json'} on:change={() => toggleExportFormat('json')} />
+								<span>JSON</span>
+							</label>
+							<label class="flex items-center gap-1 cursor-pointer">
+								<input type="radio" name="answer-export-format-{message.id}" checked={exportFormat === 'markdown'} on:change={() => toggleExportFormat('markdown')} />
+								<span>Markdown</span>
+							</label>
+							<button class="px-2 py-1 rounded-lg bg-gray-900 text-white dark:bg-white dark:text-gray-900" on:click={() => { const scope = exportChooser; if (scope) runExport(scope); }}>{$i18n.t('Export')}</button>
+						</div>
+					{/if}
 
 					{#if message.done && showRateComment}
 						<RateComment

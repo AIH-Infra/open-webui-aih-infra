@@ -112,13 +112,21 @@
 					{:else if status.count === 1}
 						{$i18n.t('Retrieved 1 source')}
 					{:else}
-						<!-- {$i18n.t('Source')} -->
-						<!-- {$i18n.t('No source available')} -->
-						<!-- {$i18n.t('No distance available')} -->
-						<!-- {$i18n.t('Retrieved {{count}} sources')} -->
 						{$i18n.t('Retrieved {{count}} sources', {
 							count: status.count
 						})}
+					{/if}
+					{#if status.rag_token_count || status.rag_doc_count}
+						<span class="text-xs text-gray-400 dark:text-gray-500">
+							{#if status.rag_doc_count}
+								({status.rag_doc_count} 块
+							{/if}
+							{#if status.rag_token_count}
+								{#if status.rag_doc_count}, {/if}{status.rag_token_count} tokens)
+							{:else if status.rag_doc_count}
+								)
+							{/if}
+						</span>
 					{/if}
 				</div>
 			</div>
