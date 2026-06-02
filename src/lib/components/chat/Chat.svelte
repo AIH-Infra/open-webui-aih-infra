@@ -33,19 +33,22 @@
 		currentChatPage,
 		temporaryChatEnabled,
 		mobile,
-		showOverview,
 		chatTitle,
 		showArtifacts,
 		artifactContents,
 		tools,
 		toolServers,
+		terminalServers,
 		functions,
 		selectedFolder,
 		pinnedChats,
-		showEmbeds
+		showEmbeds,
+		selectedTerminalId,
+		showFileNavPath,
+		showFileNavDir
 	} from '$lib/stores';
 
-	import { calculateContextTokens } from '$lib/utils/tokenCounter';
+	import { WEBUI_API_BASE_URL } from '$lib/constants';
 
 	import {
 		convertMessagesToHistory,
@@ -56,11 +59,15 @@
 		processDetails,
 		removeAllDetails,
 		getCodeBlockContents,
-		isYoutubeUrl
+		isYoutubeUrl,
+		displayFileHandler,
+		cleanupTransientMessageUI
 	} from '$lib/utils';
 	import { AudioQueue } from '$lib/utils/audio';
+	import { calculateContextTokens } from '$lib/utils/tokenCounter';
 
 	import {
+		archiveChatById,
 		createNewChat,
 		getAllTags,
 		getChatById,
@@ -73,6 +80,7 @@
 	import { generateOpenAIChatCompletion } from '$lib/apis/openai';
 	import { processWeb, processWebSearch, processYoutubeVideo } from '$lib/apis/retrieval';
 	import { getAndUpdateUserLocation, getUserSettings } from '$lib/apis/users';
+	import { getKnowledgeById, searchKnowledgeFilesById } from '../../apis/knowledge/index';
 	import {
 		chatCompleted,
 		generateQueries,
@@ -94,21 +102,23 @@
 	import ChatControls from './ChatControls.svelte';
 	import EventConfirmDialog from '../common/ConfirmDialog.svelte';
 	import Placeholder from './Placeholder.svelte';
+	import FilesOverlay from './MessageInput/FilesOverlay.svelte';
 	import NotificationToast from '../NotificationToast.svelte';
 	import Spinner from '../common/Spinner.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
 	import Sidebar from '../icons/Sidebar.svelte';
 	import Image from '../common/Image.svelte';
+	import { getBanners } from '$lib/apis/configs';
 
 	export let chatIdProp = '';
 
 	let loading = true;
 
 	const eventTarget = new EventTarget();
-	let controlPane;
-	let controlPaneComponent;
+	let controlPane: Pane | undefined;
+	let controlPaneComponent: ChatControls | undefined;
 
-	let messageInput;
+	let messageInput: MessageInput | undefined;
 
 	let autoScroll = true;
 	let processing = '';
@@ -122,9 +132,8 @@
 	let eventConfirmationInput = false;
 	let eventConfirmationInputPlaceholder = '';
 	let eventConfirmationInputValue = '';
+	let eventConfirmationInputType = '';
 	let eventCallback = null;
-
-	let chatIdUnsubscriber: Unsubscriber | undefined;
 
 	let selectedModels = [''];
 	let atSelectedModel: Model | undefined;
@@ -137,6 +146,7 @@
 
 	let selectedToolIds = [];
 	let selectedFilterIds = [];
+
 	let imageGenerationEnabled = false;
 	let webSearchEnabled = false;
 	let codeInterpreterEnabled = false;
@@ -144,6 +154,7 @@
 	let showCommands = false;
 
 	let generating = false;
+	let dragged = false;
 	let generationController = null;
 
 	let chat = null;
@@ -154,65 +165,143 @@
 		currentId: null
 	};
 
-	// Token monitoring - 混合计数方案
-	let contextTokens = 0;  // 纯对话上下文token(本地计算,不含RAG)
-	let ragTokens = 0;      // 最近一次RAG召回token
-	let sendTokens = 0;     // 最近一次发送总token(API返回,含RAG)
-
-	// 响应式更新token统计 - 混合计数方案
-	$: {
-		if (history?.messages && history.currentId) {
-			// 获取当前消息链
-			const messageList = [];
-			let currentMsg = history.messages[history.currentId];
-
-			while (currentMsg) {
-				messageList.unshift(currentMsg);
-				if (currentMsg.parentId) {
-					currentMsg = history.messages[currentMsg.parentId];
-				} else {
-					break;
-				}
-			}
-
-			// 1. 本地计算纯对话上下文token(不含RAG文档)
-			contextTokens = calculateContextTokens(messageList);
-
-			// 2. 从API获取最近一次发送的总token(含RAG)
-			const lastAssistantMsg = [...messageList].reverse().find(m => m.role === 'assistant');
-			if (lastAssistantMsg?.usage) {
-				const usage = lastAssistantMsg.usage;
-				sendTokens = usage.prompt_tokens || 0;  // API返回的总发送token(含RAG)
-
-				// 3. 计算RAG token = 发送总token - 纯对话上下文
-				ragTokens = Math.max(0, sendTokens - contextTokens);
-
-			} else {
-				sendTokens = 0;
-				ragTokens = 0;
-			}
-		}
-	}
-
 	let taskIds = null;
 
 	// Chat Input
 	let prompt = '';
-	let chatFiles = [];
-	let files = [];
-	let params = {};
+	let chatFiles: any[] = [];
+	let files: any[] = [];
+	let params: any = {
+		function_calling: 'native'
+	};
+	let collectionRefreshStates: Record<string, any> = {};
+
+	// AIH-Infra: Token monitoring
+	let contextTokens = 0;
+	let ragTokens = 0;
+	let ragDocCount = 0;
+	let sendTokens = 0;
+
+	// Message queue for storing messages while generating
+	let messageQueue: { id: string; prompt: string; files: any[] }[] = [];
+
+	const getSourceKey = (source: any) => {
+		const sourceInfo = source?.source ?? {};
+		const metadata = Array.isArray(source?.metadata) ? source.metadata : [];
+		return (
+			sourceInfo?.id ??
+			sourceInfo?.url ??
+			metadata.find((item: any) => item?.source)?.source ??
+			sourceInfo?.name ??
+			JSON.stringify(source)
+		);
+	};
+
+	const mergeSources = (existing: any[] = [], incoming: any[] = []) => {
+		const merged: any[] = [];
+		const seen = new Map<string, number>();
+
+		for (const source of [...existing, ...incoming]) {
+			if (!source || Object.keys(source).length === 0) {
+				continue;
+			}
+
+			const key = getSourceKey(source);
+			const existingIndex = seen.get(key);
+			if (existingIndex === undefined) {
+				merged.push({
+					...source,
+					document: [...(source?.document ?? [])],
+					metadata: [...(source?.metadata ?? [])],
+					distances: [...(source?.distances ?? [])]
+				});
+				seen.set(key, merged.length - 1);
+				continue;
+			}
+
+			const current = merged[existingIndex];
+			current.document = [...(current?.document ?? []), ...(source?.document ?? [])];
+			current.metadata = [...(current?.metadata ?? []), ...(source?.metadata ?? [])];
+			current.distances = [...(current?.distances ?? []), ...(source?.distances ?? [])];
+		}
+
+		return merged;
+	};
+
+	const updateContextTokens = (targetHistory = history) => {
+		if (!targetHistory?.messages || !targetHistory.currentId) {
+			contextTokens = 0;
+			sendTokens = 0;
+			ragTokens = 0;
+			return;
+		}
+
+		const messageList = [];
+		let currentMsg = targetHistory.messages[targetHistory.currentId];
+
+		while (currentMsg) {
+			messageList.unshift(currentMsg);
+			if (currentMsg.parentId) {
+				currentMsg = targetHistory.messages[currentMsg.parentId];
+			} else {
+				break;
+			}
+		}
+
+		contextTokens = calculateContextTokens(messageList);
+
+		const lastAssistantMsg = [...messageList].reverse().find((m) => m.role === 'assistant');
+		if (lastAssistantMsg?.usage) {
+			const usage = lastAssistantMsg.usage;
+			sendTokens = usage.prompt_tokens || 0;
+			ragTokens = Math.max(0, sendTokens - contextTokens);
+		} else {
+			sendTokens = 0;
+			ragTokens = 0;
+		}
+	};
+
+	let navigationRequestId = 0;
+
+	const resetChatViewState = async () => {
+		chat = null;
+		tags = [];
+		history = {
+			messages: {},
+			currentId: null
+		};
+		taskIds = null;
+		chatFiles = [];
+		params = {
+			function_calling: 'native'
+		};
+		collectionRefreshStates = {};
+		messageQueue = [];
+		chatTitle.set('');
+		chatId.set('');
+		stopAudio();
+		await initNewChat();
+	};
 
 	$: if (chatIdProp) {
 		navigateHandler();
 	}
 
 	const navigateHandler = async () => {
+		cleanupTransientMessageUI();
+		const requestId = ++navigationRequestId;
 		loading = true;
+
+		// Save current queue to sessionStorage before navigating away
+		if (messageQueue.length > 0 && $chatId) {
+			sessionStorage.setItem(`chat-queue-${$chatId}`, JSON.stringify(messageQueue));
+		}
 
 		prompt = '';
 		messageInput?.setText('');
 
 		files = [];
+		messageQueue = [];
 		selectedToolIds = [];
 		selectedFilterIds = [];
 		webSearchEnabled = false;
@@ -222,12 +311,44 @@
 			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
 		);
 
-		if (chatIdProp && (await loadChat())) {
+		const loaded = chatIdProp ? await loadChat() : false;
+		if (requestId !== navigationRequestId) {
+			return;
+		}
+
+		if (chatIdProp && loaded) {
 			await tick();
+			if (requestId !== navigationRequestId) {
+				return;
+			}
 			loading = false;
 			window.setTimeout(() => scrollToBottom(), 0);
 
 			await tick();
+
+			// Restore queue from sessionStorage
+			const storedQueueData = sessionStorage.getItem(`chat-queue-${chatIdProp}`);
+			if (storedQueueData) {
+				try {
+					const restoredQueue = JSON.parse(storedQueueData);
+
+					if (restoredQueue.length > 0) {
+						sessionStorage.removeItem(`chat-queue-${chatIdProp}`);
+						// Check if there are pending tasks (still generating)
+						const hasPendingTask = taskIds !== null && taskIds.length > 0;
+						if (!hasPendingTask) {
+							// No pending tasks - process the queue
+							files = restoredQueue.flatMap((m) => m.files);
+							await tick();
+							const combinedPrompt = restoredQueue.map((m) => m.prompt).join('\n\n');
+							await submitPrompt(combinedPrompt);
+						} else {
+							// Has pending tasks - show as queued (chatCompletedHandler will process)
+							messageQueue = restoredQueue;
+						}
+					}
+				} catch (e) {}
+			}
 
 			if (storageChatInput) {
 				try {
@@ -250,7 +371,12 @@
 			const chatInput = document.getElementById('chat-input');
 			chatInput?.focus();
 		} else {
-			await goto('/');
+			await resetChatViewState();
+			if (requestId !== navigationRequestId) {
+				return;
+			}
+			loading = false;
+			await tick();
 		}
 	};
 
@@ -292,7 +418,7 @@
 
 	const onSelectedModelIdsChange = () => {
 		resetInput();
-		oldSelectedModelIds = JSON.parse(JSON.stringify(selectedModelIds));
+		oldSelectedModelIds = structuredClone(selectedModelIds);
 	};
 
 	const resetInput = () => {
@@ -327,6 +453,10 @@
 						[...(model?.info?.meta?.toolIds ?? [])].filter((id) => $tools.find((t) => t.id === id))
 					)
 				];
+			} else if ($settings?.tools) {
+				selectedToolIds = $settings.tools;
+			} else {
+				selectedToolIds = selectedToolIds.filter((id) => !id.startsWith('direct_server:'));
 			}
 
 			// Set Default Filters (Toggleable only)
@@ -338,24 +468,35 @@
 
 			// Set Default Features
 			if (model?.info?.meta?.defaultFeatureIds) {
-				if (model.info?.meta?.capabilities?.['image_generation']) {
+				if (
+					model.info?.meta?.capabilities?.['image_generation'] &&
+					$config?.features?.enable_image_generation &&
+					($user?.role === 'admin' || $user?.permissions?.features?.image_generation)
+				) {
 					imageGenerationEnabled = model.info.meta.defaultFeatureIds.includes('image_generation');
 				}
 
-				if (model.info?.meta?.capabilities?.['web_search']) {
+				if (
+					model.info?.meta?.capabilities?.['web_search'] &&
+					$config?.features?.enable_web_search &&
+					($user?.role === 'admin' || $user?.permissions?.features?.web_search)
+				) {
 					webSearchEnabled = model.info.meta.defaultFeatureIds.includes('web_search');
 				}
 
-				if (model.info?.meta?.capabilities?.['code_interpreter']) {
+				if (
+					model.info?.meta?.capabilities?.['code_interpreter'] &&
+					$config?.features?.enable_code_interpreter &&
+					($user?.role === 'admin' || $user?.permissions?.features?.code_interpreter)
+				) {
 					codeInterpreterEnabled = model.info.meta.defaultFeatureIds.includes('code_interpreter');
 				}
 			}
 		}
 	};
 
-	const showMessage = async (message, ignoreSettings = false) => {
-		await tick();
-
+	const showMessage = async (message, scroll = true) => {
+		cleanupTransientMessageUI();
 		const _chatId = JSON.parse(JSON.stringify($chatId));
 		let _messageId = JSON.parse(JSON.stringify(message.id));
 
@@ -376,18 +517,31 @@
 		history.currentId = _messageId;
 
 		await tick();
-		await tick();
-		await tick();
 
-		if (($settings?.scrollOnBranchChange ?? true) || ignoreSettings) {
+		if (($settings?.scrollOnBranchChange ?? true) && scroll) {
 			const messageElement = document.getElementById(`message-${message.id}`);
 			if (messageElement) {
-				messageElement.scrollIntoView({ behavior: 'smooth' });
+				messageElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
 			}
 		}
 
 		await tick();
+		await tick();
+		await tick();
+
 		saveChatHandler(_chatId, history);
+	};
+
+	const terminalEventHandler = (type: string, data: any) => {
+		if (type === 'terminal:display_file') {
+			if (!data?.path) return;
+			displayFileHandler(data.path, { showControls, showFileNavPath });
+		} else if (type === 'terminal:write_file' || type === 'terminal:replace_file_content') {
+			if (!data?.path) return;
+			showFileNavDir.set(data.path);
+		} else if (type === 'terminal:run_command') {
+			showFileNavDir.set('/');
+		}
 	};
 
 	const chatEventHandler = async (event, cb) => {
@@ -402,10 +556,28 @@
 				const data = event?.data?.data ?? null;
 
 				if (type === 'status') {
+					let statusHistory;
 					if (message?.statusHistory) {
-						message.statusHistory.push(data);
+						statusHistory = [...message.statusHistory, data];
 					} else {
-						message.statusHistory = [data];
+						statusHistory = [data];
+					}
+					message = { ...message, statusHistory };
+					history = {
+						...history,
+						messages: {
+							...history.messages,
+							[event.message_id]: message
+						}
+					};
+					// AIH-Infra: Capture RAG token count
+					if (data.action === 'sources_retrieved') {
+						if (data.rag_token_count) {
+							ragTokens = data.rag_token_count;
+						}
+						if (data.rag_doc_count) {
+							ragDocCount = data.rag_doc_count;
+						}
 					}
 				} else if (type === 'chat:completion') {
 					chatCompletionEventHandler(data, message, event.chat_id);
@@ -424,6 +596,15 @@
 					message.files = data.files;
 				} else if (type === 'chat:message:embeds' || type === 'embeds') {
 					message.embeds = data.embeds;
+
+					// Auto-scroll to the embed once it's rendered in the DOM
+					await tick();
+					setTimeout(() => {
+						const embedEl = document.getElementById(`${event.message_id}-embeds-container`);
+						if (embedEl) {
+							embedEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+						}
+					}, 100);
 				} else if (type === 'chat:message:error') {
 					message.error = data.error;
 				} else if (type === 'chat:message:follow_ups') {
@@ -462,11 +643,8 @@
 						message.code_executions = message.code_executions;
 					} else {
 						// Regular source.
-						if (message?.sources) {
-							message.sources.push(data);
-						} else {
-							message.sources = [data];
-						}
+						message = { ...message, sources: mergeSources(message?.sources ?? [], [data]) };
+						history = { ...history, messages: { ...history.messages, [event.message_id]: message } };
 					}
 				} else if (type === 'notification') {
 					const toastType = data?.type ?? 'info';
@@ -513,6 +691,9 @@
 					eventConfirmationMessage = data.message;
 					eventConfirmationInputPlaceholder = data.placeholder;
 					eventConfirmationInputValue = data?.value ?? '';
+					eventConfirmationInputType = data?.type ?? '';
+				} else if (type.startsWith('terminal:')) {
+					terminalEventHandler(type, data);
 				} else {
 					console.log('Unknown message type', data);
 				}
@@ -579,74 +760,54 @@
 		savedModelIds();
 	}
 
-	let pageSubscribe = null;
-	let showControlsSubscribe = null;
-	let selectedFolderSubscribe = null;
-
 	const stopAudio = () => {
 		try {
 			speechSynthesis.cancel();
-			$audioQueue.stop();
+			$audioQueue?.stop();
 		} catch {}
 	};
 
-	onMount(async () => {
+	onMount(() => {
 		loading = true;
 		console.log('mounted');
 		window.addEventListener('message', onMessageHandler);
 		$socket?.on('events', chatEventHandler);
 
-		audioQueue.set(new AudioQueue(document.getElementById('audioElement')));
+		$audioQueue?.destroy();
 
-		pageSubscribe = page.subscribe(async (p) => {
+		const audioQueueInstance = new AudioQueue(document.getElementById('audioElement'));
+		audioQueue.set(audioQueueInstance);
+
+		// Reset direct terminal enabled states — selectedTerminalId starts null on every page load
+		if ($settings?.terminalServers?.some((s) => s.enabled)) {
+			settings.set({
+				...$settings,
+				terminalServers: ($settings.terminalServers ?? []).map((s) => ({ ...s, enabled: false }))
+			});
+		}
+
+		const pageSubscribe = page.subscribe(async (p) => {
 			if (p.url.pathname === '/') {
 				await tick();
 				initNewChat();
+
+				// Re-fetch banners on navigation to homepage so newly configured banners appear
+				try {
+					banners.set(await getBanners(localStorage.token).catch(() => []));
+				} catch (e) {
+					console.error('Failed to refresh banners:', e);
+				}
 			}
 
 			stopAudio();
 		});
 
-		const storageChatInput = sessionStorage.getItem(
-			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
-		);
-
-		if (!chatIdProp) {
-			loading = false;
+		const showControlsSubscribe = showControls.subscribe(async (value) => {
 			await tick();
-		}
-
-		if (storageChatInput) {
-			prompt = '';
-			messageInput?.setText('');
-
-			files = [];
-			selectedToolIds = [];
-			selectedFilterIds = [];
-			webSearchEnabled = false;
-			imageGenerationEnabled = false;
-			codeInterpreterEnabled = false;
-
-			try {
-				const input = JSON.parse(storageChatInput);
-
-				if (!$temporaryChatEnabled) {
-					messageInput?.setText(input.prompt);
-					files = input.files;
-					selectedToolIds = input.selectedToolIds;
-					selectedFilterIds = input.selectedFilterIds;
-					webSearchEnabled = input.webSearchEnabled;
-					imageGenerationEnabled = input.imageGenerationEnabled;
-					codeInterpreterEnabled = input.codeInterpreterEnabled;
-				}
-			} catch (e) {}
-		}
-
-		showControlsSubscribe = showControls.subscribe(async (value) => {
 			if (controlPane && !$mobile) {
 				try {
 					if (value) {
-						controlPaneComponent.openPane();
+						controlPaneComponent?.openPane();
 					} else {
 						controlPane.collapse();
 					}
@@ -657,13 +818,13 @@
 
 			if (!value) {
 				showCallOverlay.set(false);
-				showOverview.set(false);
 				showArtifacts.set(false);
 				showEmbeds.set(false);
 			}
 		});
 
-		selectedFolderSubscribe = selectedFolder.subscribe(async (folder) => {
+		const selectedFolderSubscribe = selectedFolder.subscribe(async (folder) => {
+			await tick();
 			if (
 				folder?.data?.model_ids &&
 				JSON.stringify(selectedModels) !== JSON.stringify(folder.data.model_ids)
@@ -674,22 +835,60 @@
 			}
 		});
 
-		const chatInput = document.getElementById('chat-input');
-		chatInput?.focus();
-	});
+		const storageChatInput = sessionStorage.getItem(
+			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
+		);
 
-	onDestroy(() => {
-		try {
-			pageSubscribe();
-			showControlsSubscribe();
-			selectedFolderSubscribe();
-			chatIdUnsubscriber?.();
-			window.removeEventListener('message', onMessageHandler);
-			$socket?.off('events', chatEventHandler);
-			$audioQueue?.destroy();
-		} catch (e) {
-			console.error(e);
-		}
+		const init = async () => {
+			if (!chatIdProp) {
+				loading = false;
+				await tick();
+			}
+
+			if (storageChatInput) {
+				prompt = '';
+				messageInput?.setText('');
+
+				files = [];
+				selectedToolIds = [];
+				selectedFilterIds = [];
+				webSearchEnabled = false;
+				imageGenerationEnabled = false;
+				codeInterpreterEnabled = false;
+
+				try {
+					const input = JSON.parse(storageChatInput);
+
+					if (!$temporaryChatEnabled) {
+						messageInput?.setText(input.prompt);
+						files = input.files;
+						selectedToolIds = input.selectedToolIds;
+						selectedFilterIds = input.selectedFilterIds;
+						webSearchEnabled = input.webSearchEnabled;
+						imageGenerationEnabled = input.imageGenerationEnabled;
+						codeInterpreterEnabled = input.codeInterpreterEnabled;
+					}
+				} catch (e) {}
+			}
+
+			const chatInput = document.getElementById('chat-input');
+			chatInput?.focus();
+		};
+		init();
+
+		return () => {
+			try {
+				pageSubscribe();
+				showControlsSubscribe();
+				selectedFolderSubscribe();
+				window.removeEventListener('message', onMessageHandler);
+				$socket?.off('events', chatEventHandler);
+				audioQueueInstance?.destroy();
+				audioQueue.set(null);
+			} catch (e) {
+				console.error(e);
+			}
+		};
 	});
 
 	// File upload functions
@@ -788,22 +987,6 @@
 				};
 			}
 
-			// Add session-level chunking parameters for temporary file uploads
-			if (params?.rag) {
-				metadata = {
-					...(metadata || {}),
-					...(params.rag.chunk_size !== null && params.rag.chunk_size !== undefined
-						? { chunk_size: params.rag.chunk_size }
-						: {}),
-					...(params.rag.chunk_overlap !== null && params.rag.chunk_overlap !== undefined
-						? { chunk_overlap: params.rag.chunk_overlap }
-						: {}),
-					...(params.rag.text_splitter !== null && params.rag.text_splitter !== undefined
-						? { text_splitter: params.rag.text_splitter }
-						: {})
-				};
-			}
-
 			// Upload file to server
 			console.log('Uploading file to server...');
 			const uploadedFile = await uploadFile(localStorage.token, file, metadata);
@@ -836,6 +1019,11 @@
 	};
 
 	const uploadWeb = async (urls) => {
+		if ($user?.role !== 'admin' && !($user?.permissions?.chat?.web_upload ?? true)) {
+			toast.error($i18n.t('You do not have permission to upload web content.'));
+			return;
+		}
+
 		if (!Array.isArray(urls)) {
 			urls = [urls];
 		}
@@ -887,11 +1075,19 @@
 		}
 	};
 
-	$: if (history) {
-		getContents();
-	} else {
-		artifactContents.set([]);
-	}
+	const onHistoryChange = (history) => {
+		if (history) {
+			cancelAnimationFrame(contentsRAF);
+			contentsRAF = requestAnimationFrame(() => {
+				getContents();
+				contentsRAF = null;
+			});
+		} else {
+			artifactContents.set([]);
+		}
+	};
+
+	$: onHistoryChange(history);
 
 	const getContents = () => {
 		const messages = history ? createMessagesList(history, history.currentId) : [];
@@ -1036,20 +1232,25 @@
 		if (selectedModels.length === 0 || (selectedModels.length === 1 && selectedModels[0] === '')) {
 			if (availableModels.length > 0) {
 				if (defaultModels && defaultModels.length > 0) {
-					// Set from default models
 					selectedModels = defaultModels.filter((modelId) => availableModels.includes(modelId));
 				}
 
-				// Set to first available model
-				selectedModels = [availableModels?.at(0) ?? ''];
+				if (
+					selectedModels.length === 0 ||
+					(selectedModels.length === 1 && selectedModels[0] === '')
+				) {
+					// Only fall back to first available model if default models didn't resolve
+					selectedModels = [availableModels?.at(0) ?? ''];
+				}
 			} else {
 				selectedModels = [''];
 			}
 		}
 
-		await showControls.set(false);
+		if ($mobile) {
+			await showControls.set(false);
+		}
 		await showCallOverlay.set(false);
-		await showOverview.set(false);
 		await showArtifacts.set(false);
 
 		if ($page.url.pathname.includes('/c/')) {
@@ -1068,7 +1269,11 @@
 		};
 
 		chatFiles = [];
-		params = {};
+		params = {
+			function_calling: 'native'
+		};
+		taskIds = null;
+		messageQueue = [];
 
 		if ($page.url.searchParams.get('youtube')) {
 			await uploadWeb(`https://www.youtube.com/watch?v=${$page.url.searchParams.get('youtube')}`);
@@ -1137,7 +1342,7 @@
 		}
 
 		chat = await getChatById(localStorage.token, $chatId).catch(async (error) => {
-			await goto('/');
+			console.error('Failed to load chat', error);
 			return null;
 		});
 
@@ -1160,7 +1365,7 @@
 					selectedModels = selectedModels.length > 0 ? [selectedModels[0]] : [''];
 				}
 
-				oldSelectedModelIds = JSON.parse(JSON.stringify(selectedModels));
+				oldSelectedModelIds = structuredClone(selectedModels);
 
 				history =
 					(chatContent?.history ?? undefined) !== undefined
@@ -1171,6 +1376,7 @@
 
 				params = chatContent?.params ?? {};
 				chatFiles = chatContent?.files ?? [];
+				await checkAttachedCollectionsRefreshState(chatFiles);
 
 				autoScroll = true;
 				await tick();
@@ -1182,6 +1388,8 @@
 						}
 					}
 				}
+
+				updateContextTokens(history);
 
 				const taskRes = await getTaskIdsByChatId(localStorage.token, $chatId).catch((error) => {
 					return null;
@@ -1200,12 +1408,218 @@
 		}
 	};
 
+	const getAllKnowledgeFilesById = async (id: string) => {
+		const items: any[] = [];
+		let total = 0;
+		let page = 1;
+
+		while (true) {
+			const res = await searchKnowledgeFilesById(
+				localStorage.token,
+				id,
+				null,
+				null,
+				null,
+				null,
+				page
+			).catch(() => null);
+
+			if (!res) {
+				return null;
+			}
+
+			const pageItems = res?.items ?? [];
+			total = res?.total ?? items.length;
+			items.push(...pageItems);
+
+			if (pageItems.length === 0 || items.length >= total) {
+				break;
+			}
+
+			page += 1;
+		}
+
+		return {
+			items,
+			total
+		};
+	};
+
+	const getCollectionFileIds = (collection: any): Set<string> =>
+		new Set(
+			((collection?.files ?? []) as any[]).map((file: any) => String(file.id)).filter(Boolean)
+		);
+
+	const buildRefreshedCollectionFiles = (previousFiles: any[] = [], latestFiles: any[] = []) => {
+		const previousEnabledMap = new Map<string, boolean>(
+			(previousFiles ?? []).map((file: any) => [String(file.id), file.enabled ?? true])
+		);
+
+		const refreshedFiles = (latestFiles ?? []).map((file: any) => {
+			const fileId = String(file.id);
+			return {
+				...file,
+				filename: file.name || file.filename,
+				enabled: previousEnabledMap.has(fileId) ? previousEnabledMap.get(fileId) : false
+			};
+		});
+
+		return {
+			files: refreshedFiles,
+			allFilesEnabled:
+				refreshedFiles.length > 0 && refreshedFiles.every((file: any) => file.enabled)
+		};
+	};
+
+	const checkCollectionRefreshState = async (collection: any) => {
+		if (!collection?.id || collection?.type !== 'collection') return;
+
+		const collectionId = String(collection.id);
+		collectionRefreshStates = {
+			...collectionRefreshStates,
+			[collectionId]: {
+				...(collectionRefreshStates[collectionId] ?? {}),
+				status: 'checking'
+			}
+		};
+
+		const knowledge = await getKnowledgeById(localStorage.token, collectionId).catch(() => null);
+		if (!knowledge) {
+			collectionRefreshStates = {
+				...collectionRefreshStates,
+				[collectionId]: {
+					status: 'unavailable'
+				}
+			};
+			return;
+		}
+
+		const filesRes = await getAllKnowledgeFilesById(collectionId);
+		if (!filesRes) {
+			collectionRefreshStates = {
+				...collectionRefreshStates,
+				[collectionId]: {
+					status: 'error'
+				}
+			};
+			return;
+		}
+
+		const previousIds = getCollectionFileIds(collection);
+		const latestIds = new Set(
+			((filesRes.items ?? []) as any[]).map((file: any) => String(file.id)).filter(Boolean)
+		);
+		const addedCount = [...latestIds].filter((id: string) => !previousIds.has(id)).length;
+		const removedCount = [...previousIds].filter((id: string) => !latestIds.has(id)).length;
+		const stale = addedCount > 0 || removedCount > 0;
+
+		collectionRefreshStates = {
+			...collectionRefreshStates,
+			[collectionId]: {
+				status: stale ? 'stale' : 'idle',
+				addedCount,
+				removedCount
+			}
+		};
+	};
+
+	const checkAttachedCollectionsRefreshState = async (attachedFiles: any[] = chatFiles) => {
+		const collections = (attachedFiles ?? []).filter((file: any) => file?.type === 'collection');
+		if (collections.length === 0) {
+			collectionRefreshStates = {};
+			return;
+		}
+
+		const validIds = new Set<string>(collections.map((file: any) => String(file.id)));
+		collectionRefreshStates = Object.fromEntries(
+			Object.entries(collectionRefreshStates).filter(([id]) => validIds.has(id))
+		);
+
+		await Promise.all(
+			collections.map((collection: any) => checkCollectionRefreshState(collection))
+		);
+	};
+
+	const refreshAttachedCollection = async (collectionId: string) => {
+		const target = chatFiles.find(
+			(file: any) => file?.type === 'collection' && String(file.id) === String(collectionId)
+		);
+		if (!target) return;
+
+		collectionRefreshStates = {
+			...collectionRefreshStates,
+			[String(collectionId)]: {
+				...(collectionRefreshStates[String(collectionId)] ?? {}),
+				status: 'refreshing'
+			}
+		};
+
+		const knowledge = await getKnowledgeById(localStorage.token, String(collectionId)).catch(
+			() => null
+		);
+		if (!knowledge) {
+			collectionRefreshStates = {
+				...collectionRefreshStates,
+				[String(collectionId)]: {
+					status: 'unavailable'
+				}
+			};
+			return;
+		}
+
+		const filesRes = await getAllKnowledgeFilesById(String(collectionId));
+		if (!filesRes) {
+			collectionRefreshStates = {
+				...collectionRefreshStates,
+				[String(collectionId)]: {
+					status: 'error'
+				}
+			};
+			return;
+		}
+
+		const refreshed = buildRefreshedCollectionFiles(target.files, filesRes.items);
+		chatFiles = chatFiles.map((file: any) => {
+			if (file?.type !== 'collection' || String(file.id) !== String(collectionId)) {
+				return file;
+			}
+
+			return {
+				...file,
+				...knowledge,
+				type: 'collection',
+				boost: file.boost ?? 1.0,
+				files: refreshed.files,
+				allFilesEnabled: refreshed.allFilesEnabled
+			};
+		});
+
+		await tick();
+		await saveChatHandler($chatId, history);
+		await checkCollectionRefreshState(
+			chatFiles.find(
+				(file: any) => file?.type === 'collection' && String(file.id) === String(collectionId)
+			)
+		);
+	};
+
 	const scrollToBottom = async (behavior = 'auto') => {
 		await tick();
 		if (messagesContainerElement) {
 			messagesContainerElement.scrollTo({
 				top: messagesContainerElement.scrollHeight,
 				behavior
+			});
+		}
+	};
+
+	let scrollRAF = null;
+	let contentsRAF = null;
+	const scheduleScrollToBottom = () => {
+		if (!scrollRAF) {
+			scrollRAF = requestAnimationFrame(async () => {
+				scrollRAF = null;
+				await scrollToBottom();
 			});
 		}
 	};
@@ -1267,6 +1681,18 @@
 		}
 
 		taskIds = null;
+
+		// Process message queue - combine all queued messages and submit at once
+		if (messageQueue.length > 0) {
+			const combinedPrompt = messageQueue.map((m) => m.prompt).join('\n\n');
+			const combinedFiles = messageQueue.flatMap((m) => m.files);
+			messageQueue = [];
+
+			// Set the files and submit
+			files = combinedFiles;
+			await tick();
+			await submitPrompt(combinedPrompt);
+		}
 	};
 
 	const chatActionHandler = async (_chatId, actionId, modelId, responseMessageId, event = null) => {
@@ -1340,6 +1766,11 @@
 			const modelId = selectedModels[0];
 			const model = $models.filter((m) => m.id === modelId).at(0);
 
+			if (!model) {
+				toast.error($i18n.t('Model not found'));
+				return;
+			}
+
 			const messages = createMessagesList(history, history.currentId);
 			const parentMessage = messages.length !== 0 ? messages.at(-1) : null;
 
@@ -1366,6 +1797,7 @@
 				model: modelId,
 				modelName: model.name ?? model.id,
 				modelIdx: 0,
+				ragSnapshot: buildRagSnapshot(),
 				timestamp: Math.floor(Date.now() / 1000)
 			};
 
@@ -1377,6 +1809,7 @@
 			history.messages[responseMessageId] = responseMessage;
 
 			history.currentId = responseMessageId;
+			updateContextTokens(history);
 
 			await tick();
 
@@ -1426,6 +1859,7 @@
 					model: model.id,
 					modelName: model.name ?? model.id,
 					modelIdx: 0,
+					ragSnapshot: buildRagSnapshot(),
 					timestamp: Math.floor(Date.now() / 1000),
 					...message
 				};
@@ -1456,14 +1890,19 @@
 	};
 
 	const chatCompletionEventHandler = async (data, message, chatId) => {
-		const { id, done, choices, content, sources, selected_model_id, error, usage } = data;
+		const { id, done, choices, content, output, sources, selected_model_id, error, usage } = data;
+
+		// Store raw OR-aligned output items from backend
+		if (output) {
+			message.output = output;
+		}
 
 		if (error) {
 			await handleOpenAIError(error, message);
 		}
 
-		if (sources && !message?.sources) {
-			message.sources = sources;
+		if (sources) {
+			message.sources = mergeSources([], sources);
 		}
 
 		if (choices) {
@@ -1482,27 +1921,29 @@
 						navigator.vibrate(5);
 					}
 
-					// Emit chat event for TTS
-					const messageContentParts = getMessageContentParts(
-						removeAllDetails(message.content),
-						$config?.audio?.tts?.split_on ?? 'punctuation'
-					);
-					messageContentParts.pop();
-
-					// dispatch only last sentence and make sure it hasn't been dispatched before
-					if (
-						messageContentParts.length > 0 &&
-						messageContentParts[messageContentParts.length - 1] !== message.lastSentence
-					) {
-						message.lastSentence = messageContentParts[messageContentParts.length - 1];
-						eventTarget.dispatchEvent(
-							new CustomEvent('chat', {
-								detail: {
-									id: message.id,
-									content: messageContentParts[messageContentParts.length - 1]
-								}
-							})
+					// Emit chat event for TTS (only when call overlay is active)
+					if ($showCallOverlay) {
+						const messageContentParts = getMessageContentParts(
+							removeAllDetails(message.content),
+							$config?.audio?.tts?.split_on ?? 'punctuation'
 						);
+						messageContentParts.pop();
+
+						// dispatch only last sentence and make sure it hasn't been dispatched before
+						if (
+							messageContentParts.length > 0 &&
+							messageContentParts[messageContentParts.length - 1] !== message.lastSentence
+						) {
+							message.lastSentence = messageContentParts[messageContentParts.length - 1];
+							eventTarget.dispatchEvent(
+								new CustomEvent('chat', {
+									detail: {
+										id: message.id,
+										content: messageContentParts[messageContentParts.length - 1]
+									}
+								})
+							);
+						}
 					}
 				}
 			}
@@ -1516,27 +1957,29 @@
 				navigator.vibrate(5);
 			}
 
-			// Emit chat event for TTS
-			const messageContentParts = getMessageContentParts(
-				removeAllDetails(message.content),
-				$config?.audio?.tts?.split_on ?? 'punctuation'
-			);
-			messageContentParts.pop();
-
-			// dispatch only last sentence and make sure it hasn't been dispatched before
-			if (
-				messageContentParts.length > 0 &&
-				messageContentParts[messageContentParts.length - 1] !== message.lastSentence
-			) {
-				message.lastSentence = messageContentParts[messageContentParts.length - 1];
-				eventTarget.dispatchEvent(
-					new CustomEvent('chat', {
-						detail: {
-							id: message.id,
-							content: messageContentParts[messageContentParts.length - 1]
-						}
-					})
+			// Emit chat event for TTS (only when call overlay is active)
+			if ($showCallOverlay) {
+				const messageContentParts = getMessageContentParts(
+					removeAllDetails(message.content),
+					$config?.audio?.tts?.split_on ?? 'punctuation'
 				);
+				messageContentParts.pop();
+
+				// dispatch only last sentence and make sure it hasn't been dispatched before
+				if (
+					messageContentParts.length > 0 &&
+					messageContentParts[messageContentParts.length - 1] !== message.lastSentence
+				) {
+					message.lastSentence = messageContentParts[messageContentParts.length - 1];
+					eventTarget.dispatchEvent(
+						new CustomEvent('chat', {
+							detail: {
+								id: message.id,
+								content: messageContentParts[messageContentParts.length - 1]
+							}
+						})
+					);
+				}
 			}
 		}
 
@@ -1549,10 +1992,11 @@
 			message.usage = usage;
 		}
 
-		history.messages[message.id] = message;
+		history = { ...history, messages: { ...history.messages, [message.id]: { ...message } } };
 
 		if (done) {
 			message.done = true;
+			updateContextTokens(history);
 
 			if ($settings.responseAutoCopy) {
 				copyToClipboard(message.content);
@@ -1563,18 +2007,20 @@
 				document.getElementById(`speak-button-${message.id}`)?.click();
 			}
 
-			// Emit chat event for TTS
-			let lastMessageContentPart =
-				getMessageContentParts(
-					removeAllDetails(message.content),
-					$config?.audio?.tts?.split_on ?? 'punctuation'
-				)?.at(-1) ?? '';
-			if (lastMessageContentPart) {
-				eventTarget.dispatchEvent(
-					new CustomEvent('chat', {
-						detail: { id: message.id, content: lastMessageContentPart }
-					})
-				);
+			// Emit chat event for TTS (only when call overlay is active)
+			if ($showCallOverlay) {
+				let lastMessageContentPart =
+					getMessageContentParts(
+						removeAllDetails(message.content),
+						$config?.audio?.tts?.split_on ?? 'punctuation'
+					)?.at(-1) ?? '';
+				if (lastMessageContentPart) {
+					eventTarget.dispatchEvent(
+						new CustomEvent('chat', {
+							detail: { id: message.id, content: lastMessageContentPart }
+						})
+					);
+				}
 			}
 			eventTarget.dispatchEvent(
 				new CustomEvent('chat:finish', {
@@ -1585,7 +2031,7 @@
 				})
 			);
 
-			history.messages[message.id] = message;
+			history = { ...history, messages: { ...history.messages, [message.id]: { ...message } } };
 
 			await tick();
 			if (autoScroll) {
@@ -1604,7 +2050,7 @@
 		await tick();
 
 		if (autoScroll) {
-			scrollToBottom();
+			scheduleScrollToBottom();
 		}
 	};
 
@@ -1654,12 +2100,33 @@
 			return;
 		}
 
+		// Check if there are pending tasks (more reliable than lastMessage.done)
+		if (taskIds !== null && taskIds.length > 0) {
+			if ($settings?.enableMessageQueue ?? true) {
+				// Queue the message
+				const _files = structuredClone(files);
+				messageQueue = [
+					...messageQueue,
+					{
+						id: uuidv4(),
+						prompt: userPrompt,
+						files: _files
+					}
+				];
+				// Clear input
+				messageInput?.setText('');
+				prompt = '';
+				files = [];
+				return;
+			} else {
+				// Interrupt: stop current generation and proceed
+				await stopResponse();
+				await tick();
+			}
+		}
+
 		if (history?.currentId) {
 			const lastMessage = history.messages[history.currentId];
-			if (lastMessage.done != true) {
-				// Response not done
-				return;
-			}
 
 			if (lastMessage.error && !lastMessage.content) {
 				// Error in response
@@ -1672,12 +2139,14 @@
 		prompt = '';
 
 		const messages = createMessagesList(history, history.currentId);
-		const _files = JSON.parse(JSON.stringify(files));
+		const _files = structuredClone(files);
 
 		chatFiles.push(
 			..._files.filter(
 				(item) =>
-					['doc', 'text', 'note', 'chat', 'folder', 'collection'].includes(item.type) ||
+					(item.type === 'collection'
+						? item.files && item.files.some((f) => f.enabled)
+						: ['doc', 'text', 'note', 'chat', 'folder'].includes(item.type)) ||
 					(item.type === 'file' && !(item?.content_type ?? '').startsWith('image/'))
 			)
 		);
@@ -1741,7 +2210,7 @@
 		}
 
 		let _chatId = JSON.parse(JSON.stringify($chatId));
-		_history = JSON.parse(JSON.stringify(_history));
+		_history = structuredClone(_history);
 
 		const responseMessageIds: Record<PropertyKey, string> = {};
 		// If modelId is provided, use it, else use selected model
@@ -1766,12 +2235,14 @@
 					model: model.id,
 					modelName: model.name ?? model.id,
 					modelIdx: modelIdx ? modelIdx : _modelIdx,
+					ragSnapshot: buildRagSnapshot(),
 					timestamp: Math.floor(Date.now() / 1000) // Unix epoch
 				};
 
 				// Add message to history and Set currentId to messageId
 				history.messages[responseMessageId] = responseMessage;
 				history.currentId = responseMessageId;
+				updateContextTokens(history);
 
 				// Append messageId to childrenIds of parent message
 				if (parentId !== null && history.messages[parentId]) {
@@ -1794,7 +2265,7 @@
 
 		await tick();
 
-		_history = JSON.parse(JSON.stringify(history));
+		_history = structuredClone(history);
 		// Save chat after all messages have been created
 		await saveChatHandler(_chatId, _history);
 
@@ -1891,6 +2362,39 @@
 		return features;
 	};
 
+	const cloneValue = (value) => {
+		if (value === undefined) {
+			return undefined;
+		}
+
+		return structuredClone(value);
+	};
+
+	const buildRagSnapshot = () => {
+		const requestParams = params ?? {};
+		const ragParams = requestParams?.rag ?? {};
+		const agentRagConfig = requestParams?.agent_rag_config ?? {};
+
+		return {
+			rag_mode: requestParams?.rag_mode ?? 'traditional',
+			rag: cloneValue(ragParams),
+			agent_rag_config: cloneValue(agentRagConfig),
+			embedding_model: $config?.features?.retrieval_model ?? null,
+			reranking_model: ragParams?.reranking_model ?? agentRagConfig?.reranking_model ?? null
+		};
+	};
+
+	const getStopTokens = () => {
+		const stop = params?.stop ?? $settings?.params?.stop;
+		if (!stop) return undefined;
+
+		const tokens = Array.isArray(stop) ? stop : stop.split(',').map((s) => s.trim());
+
+		return tokens
+			.filter(Boolean)
+			.map((token) => decodeURIComponent(JSON.parse(`"${token.replace(/"/g, '\\"')}"`)));
+	};
+
 	const sendMessageSocket = async (model, _messages, _history, responseMessageId, _chatId) => {
 		const responseMessage = _history.messages[responseMessageId];
 		const userMessage = _history.messages[responseMessage.parentId];
@@ -1905,7 +2409,7 @@
 			return fileExists;
 		});
 
-		let files = JSON.parse(JSON.stringify(chatFiles));
+		let files = structuredClone(chatFiles);
 		files.push(
 			...(userMessage?.files ?? []).filter(
 				(item) =>
@@ -1952,7 +2456,9 @@
 				: undefined,
 			..._messages.map((message) => ({
 				...message,
-				content: processDetails(message.content)
+				content: processDetails(message.content),
+				// Include output for temp chats (backend will use it and strip before LLM)
+				...(message.output ? { output: message.output } : {})
 			}))
 		].filter((message) => message);
 
@@ -1964,6 +2470,7 @@
 
 				return {
 					role: message.role,
+					...(message.output ? { output: message.output } : {}),
 					...(message.role === 'user' && imageFiles.length > 0
 						? {
 								content: [
@@ -2003,6 +2510,45 @@
 			}
 		}
 
+		// Parse skill mentions (<$skillId|label>) from user messages
+		const skillMentionRegex = /<\$([^|>]+)\|?[^>]*>/g;
+		const skillIds = [];
+		for (const message of messages) {
+			const content =
+				typeof message.content === 'string' ? message.content : (message.content?.[0]?.text ?? '');
+			for (const match of content.matchAll(skillMentionRegex)) {
+				if (!skillIds.includes(match[1])) {
+					skillIds.push(match[1]);
+				}
+			}
+		}
+
+		// Strip skill mentions from message content
+		if (skillIds.length > 0) {
+			messages = messages.map((message) => {
+				if (typeof message.content === 'string') {
+					return {
+						...message,
+						content: message.content.replace(/<\$[^>]+>/g, '').trim()
+					};
+				} else if (Array.isArray(message.content)) {
+					return {
+						...message,
+						content: message.content.map((part) =>
+							part.type === 'text'
+								? { ...part, text: part.text.replace(/<\$[^>]+>/g, '').trim() }
+								: part
+						)
+					};
+				}
+				return message;
+			});
+		}
+
+		// Use the user-selected terminal from the dropdown
+		const activeTerminalId = $selectedTerminalId ?? null;
+		const isAgentRagMode = params?.rag_mode === 'agent';
+
 		const res = await generateOpenAIChatCompletion(
 			localStorage.token,
 			{
@@ -2012,24 +2558,28 @@
 				params: {
 					...$settings?.params,
 					...params,
-					stop:
-						(params?.stop ?? $settings?.params?.stop ?? undefined)
-							? (params?.stop.split(',').map((token) => token.trim()) ?? $settings.params.stop).map(
-									(str) => decodeURIComponent(JSON.parse('"' + str.replace(/\"/g, '\\"') + '"'))
-								)
-							: undefined
+					stop: getStopTokens()
 				},
 
 				files: (files?.length ?? 0) > 0 ? files : undefined,
 
 				filter_ids: selectedFilterIds.length > 0 ? selectedFilterIds : undefined,
 				tool_ids: toolIds.length > 0 ? toolIds : undefined,
-				tool_servers: ($toolServers ?? []).filter(
-					(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
-				),
+				skill_ids: skillIds.length > 0 ? skillIds : undefined,
+				terminal_id: !isAgentRagMode ? (activeTerminalId ?? undefined) : undefined,
+				tool_servers: [
+					...($toolServers ?? []).filter(
+						(server, idx) => toolServerIds.includes(idx) || toolServerIds.includes(server?.id)
+					),
+					...(!isAgentRagMode ? ($terminalServers ?? []).filter((t) => !t.id) : [])
+				],
 				features: getFeatures(),
 				variables: {
-					...getPromptVariables($user?.name, $settings?.userLocation ? userLocation : undefined)
+					...getPromptVariables(
+						$user?.name,
+						$settings?.userLocation ? userLocation : undefined,
+						$user?.email
+					)
 				},
 				model_item: $models.find((m) => m.id === model.id),
 
@@ -2087,6 +2637,7 @@
 
 			history.messages[responseMessageId] = responseMessage;
 			history.currentId = responseMessageId;
+			updateContextTokens(history);
 
 			return null;
 		});
@@ -2319,7 +2870,7 @@
 					}
 
 					if (autoScroll) {
-						scrollToBottom();
+						scheduleScrollToBottom();
 					}
 				}
 
@@ -2372,8 +2923,15 @@
 		return _chatId;
 	};
 
+	const syncControlsState = async () => {
+		params = { ...params };
+		chatFiles = [...chatFiles];
+		await tick();
+	};
+
 	const saveChatHandler = async (_chatId, history) => {
 		if ($chatId == _chatId) {
+			await syncControlsState();
 			if (!$temporaryChatEnabled) {
 				chat = await updateChatById(localStorage.token, _chatId, {
 					models: selectedModels,
@@ -2435,6 +2993,25 @@
 			toast.error($i18n.t('Failed to move chat'));
 		}
 	};
+
+	const archiveChatHandler = async (id: string) => {
+		try {
+			await archiveChatById(localStorage.token, id);
+			currentChatPage.set(1);
+			initNewChat();
+			await goto('/');
+			getChatList(localStorage.token, $currentChatPage).then((chats) => {
+				chats.set(chats);
+			});
+			getPinnedChatList(localStorage.token).then((pinnedChats) => {
+				pinnedChats.set(pinnedChats);
+			});
+			toast.success($i18n.t('Chat archived.'));
+		} catch (error) {
+			console.error('Error archiving chat:', error);
+			toast.error($i18n.t('Failed to archive chat.'));
+		}
+	};
 </script>
 
 <svelte:head>
@@ -2454,6 +3031,7 @@
 	input={eventConfirmationInput}
 	inputPlaceholder={eventConfirmationInputPlaceholder}
 	inputValue={eventConfirmationInputValue}
+	inputType={eventConfirmationInputType}
 	on:confirm={(e) => {
 		if (e.detail) {
 			eventCallback(e.detail);
@@ -2497,6 +3075,7 @@
 
 			<PaneGroup direction="horizontal" class="w-full h-full">
 				<Pane defaultSize={50} minSize={30} class="h-full flex relative max-w-full flex-col">
+					<FilesOverlay show={dragged} />
 					<Navbar
 						bind:this={navbarElement}
 						chat={{
@@ -2515,7 +3094,7 @@
 						bind:selectedModels
 						shareEnabled={!!history.currentId}
 						{initNewChat}
-						archiveChatHandler={() => {}}
+						{archiveChatHandler}
 						{moveChatHandler}
 						onSaveTempChat={async () => {
 							try {
@@ -2533,6 +3112,7 @@
 										id: uuidv4(),
 										title: title.length > 50 ? `${title.slice(0, 50)}...` : title,
 										models: selectedModels,
+										params: params,
 										history: history,
 										messages: messages,
 										timestamp: Date.now()
@@ -2555,8 +3135,8 @@
 						}}
 					/>
 
-					<div class="flex flex-col flex-auto z-10 w-full @container overflow-auto">
-						{#if ($settings?.landingPageMode === 'chat' && !$selectedFolder) || createMessagesList(history, history.currentId).length > 0}
+					<div id="chat-pane" class="flex flex-col flex-auto z-10 w-full @container overflow-auto">
+						{#if !$selectedFolder || createMessagesList(history, history.currentId).length > 0}
 							<div
 								class=" pb-2.5 flex flex-col justify-between w-full flex-auto overflow-auto h-0 max-w-full z-10 scrollbar-hidden"
 								id="messages-container"
@@ -2593,20 +3173,19 @@
 								</div>
 							</div>
 
-							<!-- Token监控显示 - 固定在输入框上方 -->
+							<!-- AIH-Infra: Token monitoring display -->
 							{#if history?.messages && Object.keys(history.messages).length > 0 && sendTokens > 0}
-								<div class="border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 px-4 py-2">
+								<div
+									class="border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50 px-4 py-2"
+								>
 									<div class="flex items-center justify-between text-xs">
 										<div class="flex items-center gap-4">
-											<!-- 上下文Token -->
 											<div class="flex items-center gap-1.5">
 												<span class="text-gray-500 dark:text-gray-400">对话上下文:</span>
 												<span class="font-mono font-medium text-blue-600 dark:text-blue-400">
 													{contextTokens.toLocaleString()}
 												</span>
 											</div>
-
-											<!-- RAG Token -->
 											{#if ragTokens > 0}
 												<div class="flex items-center gap-1.5">
 													<span class="text-gray-500 dark:text-gray-400">最近RAG:</span>
@@ -2615,8 +3194,14 @@
 													</span>
 												</div>
 											{/if}
-
-											<!-- 最近发送总Token -->
+											{#if ragDocCount > 0}
+												<div class="flex items-center gap-1.5">
+													<span class="text-gray-500 dark:text-gray-400">召回块数:</span>
+													<span class="font-mono font-medium text-orange-600 dark:text-orange-400">
+														{ragDocCount}
+													</span>
+												</div>
+											{/if}
 											<div class="flex items-center gap-1.5">
 												<span class="text-gray-500 dark:text-gray-400">最近发送:</span>
 												<span class="font-mono font-medium text-purple-600 dark:text-purple-400">
@@ -2644,11 +3229,40 @@
 									bind:webSearchEnabled
 									bind:atSelectedModel
 									bind:showCommands
+									bind:dragged
 									toolServers={$toolServers}
 									{generating}
 									{stopResponse}
 									{createMessagePair}
 									{onUpload}
+									{messageQueue}
+									onQueueSendNow={async (id) => {
+										const item = messageQueue.find((m) => m.id === id);
+										if (item) {
+											// Remove from queue
+											messageQueue = messageQueue.filter((m) => m.id !== id);
+											// Stop current generation first
+											await stopResponse();
+											await tick();
+											// Set files and submit
+											files = item.files;
+											await tick();
+											await submitPrompt(item.prompt);
+										}
+									}}
+									onQueueEdit={(id) => {
+										const item = messageQueue.find((m) => m.id === id);
+										if (item) {
+											// Remove from queue
+											messageQueue = messageQueue.filter((m) => m.id !== id);
+											// Set files and restore prompt to input
+											files = item.files;
+											messageInput?.setText(item.prompt);
+										}
+									}}
+									onQueueDelete={(id) => {
+										messageQueue = messageQueue.filter((m) => m.id !== id);
+									}}
 									onChange={(data) => {
 										if (!$temporaryChatEnabled) {
 											saveDraft(data, $chatId);
@@ -2686,6 +3300,7 @@
 									bind:webSearchEnabled
 									bind:atSelectedModel
 									bind:showCommands
+									bind:dragged
 									toolServers={$toolServers}
 									{stopResponse}
 									{createMessagePair}
@@ -2715,6 +3330,8 @@
 					bind:chatFiles
 					bind:params
 					bind:files
+					{collectionRefreshStates}
+					{refreshAttachedCollection}
 					bind:pane={controlPane}
 					chatId={$chatId}
 					modelId={selectedModelIds?.at(0) ?? null}
@@ -2729,6 +3346,7 @@
 					{stopResponse}
 					{showMessage}
 					{eventTarget}
+					{codeInterpreterEnabled}
 				/>
 			</PaneGroup>
 		</div>
