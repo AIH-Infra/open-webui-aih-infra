@@ -19,6 +19,7 @@ from open_webui.utils.plugin import (
     load_function_module_by_id,
     replace_imports,
     get_function_module_from_cache,
+    resolve_valves_schema_options,
 )
 from open_webui.config import CACHE_DIR
 from open_webui.constants import ERROR_MESSAGES
@@ -27,7 +28,6 @@ from open_webui.utils.auth import get_admin_user, get_verified_user
 from pydantic import BaseModel, HttpUrl
 from open_webui.internal.db import get_session
 from sqlalchemy.orm import Session
-
 
 log = logging.getLogger(__name__)
 
@@ -446,7 +446,10 @@ async def get_function_valves_spec_by_id(
 
         if hasattr(function_module, "Valves"):
             Valves = function_module.Valves
-            return Valves.schema()
+            schema = Valves.schema()
+            # Resolve dynamic options for select dropdowns
+            schema = resolve_valves_schema_options(Valves, schema, user)
+            return schema
         return None
     else:
         raise HTTPException(
@@ -517,7 +520,12 @@ async def get_function_user_valves_by_id(
         try:
             user_valves = Functions.get_user_valves_by_id_and_user_id(
                 id, user.id, db=db
-            )
+            ) or {}
+            function_module, _, _ = get_function_module_from_cache(request, id)
+            if hasattr(function_module, "UserValves"):
+                schema = function_module.UserValves.schema()
+                if "scope" in schema.get("properties", {}) and "enable_reranking" not in user_valves:
+                    user_valves["enable_reranking"] = False
             return user_valves
         except Exception as e:
             raise HTTPException(
@@ -546,7 +554,18 @@ async def get_function_user_valves_spec_by_id(
 
         if hasattr(function_module, "UserValves"):
             UserValves = function_module.UserValves
-            return UserValves.schema()
+            schema = UserValves.schema()
+            properties = schema.setdefault("properties", {})
+            if "scope" in properties and "enable_reranking" not in properties:
+                properties["enable_reranking"] = {
+                    "title": "Reranking",
+                    "description": "Enable reranking for Agent RAG. When off, Agent retrieval keeps the current vector-only behavior even if a reranking model is selected.",
+                    "type": "boolean",
+                    "default": False,
+                }
+            # Resolve dynamic options for select dropdowns
+            schema = resolve_valves_schema_options(UserValves, schema, user)
+            return schema
         return None
     else:
         raise HTTPException(
@@ -575,8 +594,11 @@ async def update_function_user_valves_by_id(
 
             try:
                 form_data = {k: v for k, v in form_data.items() if v is not None}
+                extra_enable_reranking = form_data.pop("enable_reranking", None)
                 user_valves = UserValves(**form_data)
                 user_valves_dict = user_valves.model_dump(exclude_unset=True)
+                if extra_enable_reranking is not None:
+                    user_valves_dict["enable_reranking"] = extra_enable_reranking
                 Functions.update_user_valves_by_id_and_user_id(
                     id, user.id, user_valves_dict, db=db
                 )
