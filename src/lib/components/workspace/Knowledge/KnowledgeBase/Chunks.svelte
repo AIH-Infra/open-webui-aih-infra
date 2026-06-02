@@ -4,16 +4,16 @@
 	import { getKnowledgeChunks } from '$lib/apis/knowledge';
 	import Spinner from '$lib/components/common/Spinner.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: any = getContext('i18n');
 
 	export let knowledgeId: string;
 
 	let loading = false;
-	let chunks = [];
-	let statistics = null;
+	let chunks: any[] = [];
+	let statistics: any = null;
 	let currentPage = 1;
 	let pageSize = 20;
-	let selectedChunk = null;
+	let selectedChunk: any = null;
 
 	onMount(async () => {
 		await loadChunks();
@@ -59,6 +59,11 @@
 	const formatNumber = (num: number) => {
 		return num?.toLocaleString() || '0';
 	};
+
+	const formatPageRange = (start: number, end?: number) => {
+		if (!start) return '';
+		return end && end !== start ? `${start}-${end}` : `${start}`;
+	};
 </script>
 
 <div class="flex flex-col h-full">
@@ -67,7 +72,6 @@
 			<Spinner className="size-6" />
 		</div>
 	{:else if statistics}
-		<!-- Statistics Section -->
 		<div class="mb-4 p-4 bg-gray-50 dark:bg-gray-800 rounded-lg">
 			<h3 class="text-lg font-semibold mb-3">{$i18n.t('Chunk Statistics')}</h3>
 			<div class="grid grid-cols-2 md:grid-cols-5 gap-4">
@@ -93,7 +97,6 @@
 				</div>
 			</div>
 
-			<!-- Token Distribution -->
 			<div class="mt-4">
 				<h4 class="text-sm font-semibold mb-2">{$i18n.t('Token Distribution')}</h4>
 				<div class="grid grid-cols-5 gap-2">
@@ -106,7 +109,6 @@
 				</div>
 			</div>
 
-			<!-- Character Distribution -->
 			<div class="mt-4">
 				<h4 class="text-sm font-semibold mb-2">{$i18n.t('Character Distribution')}</h4>
 				<div class="grid grid-cols-5 gap-2">
@@ -120,7 +122,6 @@
 			</div>
 		</div>
 
-		<!-- Chunks List -->
 		<div class="flex-1 overflow-y-auto">
 			<div class="space-y-2">
 				{#each chunks as chunk, idx}
@@ -152,8 +153,41 @@
 							</div>
 						{/if}
 
+						{#if chunk.metadata?.page_start || chunk.metadata?.print_page_start}
+							<div class="text-xs text-gray-500 mb-2">
+								{#if chunk.metadata?.page_start}
+									<span>{$i18n.t('Pages')}: {formatPageRange(chunk.metadata.page_start, chunk.metadata.page_end)}</span>
+								{/if}
+								{#if chunk.metadata?.print_page_start}
+									<span>{chunk.metadata?.page_start ? ' | ' : ''}Printed Pages: {formatPageRange(chunk.metadata.print_page_start, chunk.metadata.print_page_end)}</span>
+								{/if}
+							</div>
+						{/if}
+
+						{#if chunk.metadata?.['Header 1'] || chunk.metadata?.['Header 2']}
+							<div class="text-xs text-gray-500 mb-2">
+								{#if chunk.metadata['Header 1']}
+									<span class="font-medium">{chunk.metadata['Header 1']}</span>
+								{/if}
+								{#if chunk.metadata['Header 2']}
+									<span> › {chunk.metadata['Header 2']}</span>
+								{/if}
+							</div>
+						{/if}
+
+						{#if chunk.metadata?.chunk_size || chunk.metadata?.text_splitter}
+							<div class="text-xs text-gray-400 mb-2">
+								{#if chunk.metadata.chunk_size}
+									<span>chunk_size: {chunk.metadata.chunk_size}</span>
+								{/if}
+								{#if chunk.metadata.text_splitter}
+									<span class="ml-2">splitter: {chunk.metadata.text_splitter}</span>
+								{/if}
+							</div>
+						{/if}
+
 						<div class="text-sm text-gray-600 dark:text-gray-400 line-clamp-2">
-							{chunk.content.substring(0, 200)}...
+							{chunk.content.substring(0, 200)}{chunk.content.length > 200 ? '...' : ''}
 						</div>
 
 						{#if selectedChunk === chunk.id}
@@ -166,34 +200,32 @@
 			</div>
 		</div>
 
-		<!-- Pagination -->
-		<div class="mt-4 flex justify-between items-center">
-			<div class="text-sm text-gray-500">
-				{$i18n.t('Showing')}
-				{(currentPage - 1) * pageSize + 1}-{Math.min(
-					currentPage * pageSize,
-					statistics.total_count
-				)}
-				{$i18n.t('of')}
-				{statistics.total_count}
+		{#if statistics.total_count > pageSize}
+			<div class="mt-4 flex justify-between items-center">
+				<div class="text-sm text-gray-500">
+					{$i18n.t('Showing')}
+					{(currentPage - 1) * pageSize + 1}-{Math.min(currentPage * pageSize, statistics.total_count)}
+					{$i18n.t('of')}
+					{statistics.total_count}
+				</div>
+				<div class="flex gap-2">
+					<button
+						class="px-3 py-1 text-sm bg-gray-200 dark:bg-gray-700 rounded hover:bg-gray-300 dark:hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed"
+						disabled={currentPage === 1}
+						on:click={prevPage}
+					>
+						{$i18n.t('Previous')}
+					</button>
+					<button
+						class="px-3 py-1 text-sm bg-gray-200 dark:bg-gray-700 rounded hover:bg-gray-300 dark:hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed"
+						disabled={currentPage * pageSize >= statistics.total_count}
+						on:click={nextPage}
+					>
+						{$i18n.t('Next')}
+					</button>
+				</div>
 			</div>
-			<div class="flex gap-2">
-				<button
-					class="px-3 py-1 text-sm bg-gray-200 dark:bg-gray-700 rounded hover:bg-gray-300 dark:hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed"
-					disabled={currentPage === 1}
-					on:click={prevPage}
-				>
-					{$i18n.t('Previous')}
-				</button>
-				<button
-					class="px-3 py-1 text-sm bg-gray-200 dark:bg-gray-700 rounded hover:bg-gray-300 dark:hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed"
-					disabled={currentPage * pageSize >= statistics.total_count}
-					on:click={nextPage}
-				>
-					{$i18n.t('Next')}
-				</button>
-			</div>
-		</div>
+		{/if}
 	{:else}
 		<div class="flex justify-center items-center h-64 text-gray-500">
 			{$i18n.t('No chunks found')}

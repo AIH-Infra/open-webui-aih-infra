@@ -31,6 +31,7 @@
 		resetKnowledgeById,
 		updateFileFromKnowledgeById,
 		updateKnowledgeById,
+		updateKnowledgeAccessGrants,
 		searchKnowledgeFilesById
 	} from '$lib/apis/knowledge';
 	import { processWeb, processYoutubeVideo } from '$lib/apis/retrieval';
@@ -67,6 +68,8 @@
 	let showSyncConfirmModal = false;
 	let showAccessControlModal = false;
 
+	let currentView = 'files'; // 'files' or 'chunks'
+
 	let minSize = 0;
 	type Knowledge = {
 		id: string;
@@ -76,6 +79,14 @@
 			file_ids: string[];
 		};
 		files: any[];
+		access_grants?: any[];
+		write_access?: boolean;
+		chunk_size?: number | null;
+		chunk_overlap?: number | null;
+		text_splitter?: string | null;
+		meta?: {
+			enable_markdown_splitting?: boolean | null;
+		};
 	};
 
 	let id = null;
@@ -89,7 +100,8 @@
 	let inputFiles = null;
 
 	let query = '';
-	let currentView = 'files'; // 'files' or 'chunks'
+	let searchDebounceTimer: ReturnType<typeof setTimeout>;
+
 	let viewOption = null;
 	let sortKey = null;
 	let direction = null;
@@ -107,9 +119,18 @@
 		await getItemsPage();
 	};
 
+	// Debounce only query changes
+	$: if (query !== undefined) {
+		clearTimeout(searchDebounceTimer);
+
+		searchDebounceTimer = setTimeout(() => {
+			getItemsPage();
+		}, 300);
+	}
+
+	// Immediate response to filter/pagination changes
 	$: if (
 		knowledgeId !== null &&
-		query !== undefined &&
 		viewOption !== undefined &&
 		sortKey !== undefined &&
 		direction !== undefined &&
@@ -212,7 +233,17 @@
 						res.content
 					);
 
-					const uploadedFile = await uploadFile(localStorage.token, file).catch((e) => {
+					const uploadedFile = await uploadFile(localStorage.token, file, {
+					knowledge_id: knowledge.id,
+					...(knowledge.chunk_size && { chunk_size: knowledge.chunk_size }),
+					...(knowledge.chunk_overlap !== null && knowledge.chunk_overlap !== undefined && {
+						chunk_overlap: knowledge.chunk_overlap
+					}),
+					...(knowledge.text_splitter && { text_splitter: knowledge.text_splitter }),
+					...(knowledge.meta?.enable_markdown_splitting !== undefined && {
+						enable_markdown_splitting: knowledge.meta.enable_markdown_splitting
+					})
+				}).catch((e) => {
 						toast.error(`${e}`);
 						return null;
 					});
@@ -289,6 +320,14 @@
 		try {
 			let metadata = {
 				knowledge_id: knowledge.id,
+				...(knowledge.chunk_size && { chunk_size: knowledge.chunk_size }),
+				...(knowledge.chunk_overlap !== null && knowledge.chunk_overlap !== undefined && {
+					chunk_overlap: knowledge.chunk_overlap
+				}),
+				...(knowledge.text_splitter && { text_splitter: knowledge.text_splitter }),
+				...(knowledge.meta?.enable_markdown_splitting !== undefined && {
+					enable_markdown_splitting: knowledge.meta.enable_markdown_splitting
+				}),
 				// If the file is an audio file, provide the language for STT.
 				...((file.type.startsWith('audio/') || file.type.startsWith('video/')) &&
 				$settings?.audio?.stt?.language
@@ -596,16 +635,26 @@
 		}
 
 		debounceTimeout = setTimeout(async () => {
-			if (knowledge.name.trim() === '' || knowledge.description.trim() === '') {
+			const currentKnowledge = knowledge;
+			if (!currentKnowledge) {
+				return;
+			}
+
+			if (currentKnowledge.name.trim() === '' || currentKnowledge.description.trim() === '') {
 				toast.error($i18n.t('Please fill in all fields.'));
 				return;
 			}
 
 			const res = await updateKnowledgeById(localStorage.token, id, {
-				...knowledge,
-				name: knowledge.name,
-				description: knowledge.description,
-				access_control: knowledge.access_control
+				...currentKnowledge,
+				name: currentKnowledge.name,
+				description: currentKnowledge.description,
+				access_grants: currentKnowledge.access_grants ?? [],
+				chunk_size: currentKnowledge.chunk_size,
+				chunk_overlap: currentKnowledge.chunk_overlap,
+				text_splitter: currentKnowledge.text_splitter,
+				enable_markdown_splitting:
+					currentKnowledge.meta?.enable_markdown_splitting ?? null
 			}).catch((e) => {
 				toast.error(`${e}`);
 			});
@@ -736,6 +785,9 @@
 
 		if (res) {
 			knowledge = res;
+			if (!Array.isArray(knowledge?.access_grants)) {
+				knowledge.access_grants = [];
+			}
 			knowledgeId = knowledge?.id;
 		} else {
 			goto('/workspace/knowledge');
@@ -748,6 +800,7 @@
 	});
 
 	onDestroy(() => {
+		clearTimeout(searchDebounceTimer);
 		mediaQuery?.removeEventListener('change', handleMediaQuery);
 		const dropZone = document.querySelector('body');
 		dropZone?.removeEventListener('dragover', onDragOver);
@@ -818,11 +871,18 @@
 	{#if id && knowledge}
 		<AccessControlModal
 			bind:show={showAccessControlModal}
-			bind:accessControl={knowledge.access_control}
+			bind:accessGrants={knowledge.access_grants}
 			share={$user?.permissions?.sharing?.knowledge || $user?.role === 'admin'}
 			sharePublic={$user?.permissions?.sharing?.public_knowledge || $user?.role === 'admin'}
-			onChange={() => {
-				changeDebounceHandler();
+			shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) ||
+				$user?.role === 'admin'}
+			onChange={async () => {
+				try {
+					await updateKnowledgeAccessGrants(localStorage.token, id, knowledge.access_grants ?? []);
+					toast.success($i18n.t('Saved'));
+				} catch (error) {
+					toast.error(`${error}`);
+				}
 			}}
 			accessRoles={['read', 'write']}
 		/>
@@ -833,8 +893,9 @@
 						<div class="w-full flex justify-between items-center">
 							<input
 								type="text"
-								class="text-left w-full font-medium text-lg font-primary bg-transparent outline-hidden flex-1"
+								class="text-left w-full text-lg bg-transparent outline-hidden flex-1"
 								bind:value={knowledge.name}
+								aria-label={$i18n.t('Knowledge Name')}
 								placeholder={$i18n.t('Knowledge Name')}
 								disabled={!knowledge?.write_access}
 								on:input={() => {
@@ -882,6 +943,7 @@
 							type="text"
 							class="text-left text-xs w-full text-gray-500 bg-transparent outline-hidden"
 							bind:value={knowledge.description}
+							aria-label={$i18n.t('Knowledge Description')}
 							placeholder={$i18n.t('Knowledge Description')}
 							disabled={!knowledge?.write_access}
 							on:input={() => {
@@ -889,38 +951,25 @@
 							}}
 						/>
 					</div>
-
-					{#if knowledge.chunk_size || knowledge.chunk_overlap || knowledge.text_splitter || knowledge.meta?.enable_markdown_splitting !== undefined}
-						<div class="flex items-center gap-3 mt-1 text-xs text-gray-500">
-							{#if knowledge.chunk_size}
-								<span class="flex items-center gap-1">
-									<span class="font-medium">{$i18n.t('Chunk Size')}:</span>
-									<span>{knowledge.chunk_size}</span>
-								</span>
-							{/if}
-							{#if knowledge.chunk_overlap}
-								<span class="flex items-center gap-1">
-									<span class="font-medium">{$i18n.t('Overlap')}:</span>
-									<span>{knowledge.chunk_overlap}</span>
-								</span>
-							{/if}
-							{#if knowledge.text_splitter}
-								<span class="flex items-center gap-1">
-									<span class="font-medium">{$i18n.t('Splitter')}:</span>
-									<span class="capitalize">{knowledge.text_splitter}</span>
-								</span>
-							{/if}
-							{#if knowledge.meta?.enable_markdown_splitting !== undefined && knowledge.meta?.enable_markdown_splitting !== null}
-								<span class="flex items-center gap-1">
-									<span class="font-medium">{$i18n.t('Markdown Splitting')}:</span>
-									<span>{knowledge.meta.enable_markdown_splitting ? $i18n.t('Enabled') : $i18n.t('Disabled')}</span>
-								</span>
-							{/if}
-						</div>
-					{/if}
 				</div>
 			</div>
 		</div>
+
+		<!-- AIH-Infra: RAG Parameters Display -->
+		{#if knowledge?.chunk_size || (knowledge?.chunk_overlap !== null && knowledge?.chunk_overlap !== undefined) || knowledge?.text_splitter || knowledge?.meta?.enable_markdown_splitting !== undefined}
+			<div class="px-3.5 py-2 text-xs text-gray-500 dark:text-gray-400 flex items-center gap-4">
+				{#if knowledge?.chunk_size}
+					<span>切块大小: {knowledge.chunk_size}</span>
+				{/if}
+				{#if knowledge?.chunk_overlap !== null && knowledge?.chunk_overlap !== undefined}
+					<span>重叠大小: {knowledge.chunk_overlap}</span>
+				{/if}
+				{#if knowledge?.text_splitter}
+					<span>分块方式: {knowledge.text_splitter}</span>
+				{/if}
+				<span>MD标题提取: {knowledge?.meta?.enable_markdown_splitting === true ? '开启' : knowledge?.meta?.enable_markdown_splitting === false ? '关闭' : '未设置'}</span>
+			</div>
+		{/if}
 
 		<div
 			class="mt-2 mb-2.5 py-2 -mx-0 bg-white dark:bg-gray-900 rounded-3xl border border-gray-100/30 dark:border-gray-850/30 flex-1"
@@ -933,7 +982,8 @@
 					<input
 						class=" w-full text-sm pr-4 py-1 rounded-r-xl outline-hidden bg-transparent"
 						bind:value={query}
-						placeholder={`${$i18n.t('Search Collection')}`}
+						aria-label={$i18n.t('Search Collection')}
+						placeholder={$i18n.t('Search Collection')}
 						on:focus={() => {
 							selectedFileId = null;
 						}}
@@ -1015,36 +1065,35 @@
 							/>
 						{/if}
 					</div>
-
-					<!-- View Toggle Buttons -->
-					<div class="flex gap-1 ml-auto">
-						<button
-							class="px-3 py-1.5 text-xs rounded-lg transition {currentView === 'files'
-								? 'bg-gray-200 dark:bg-gray-700 font-semibold'
-								: 'hover:bg-gray-100 dark:hover:bg-gray-800'}"
-							on:click={() => (currentView = 'files')}
-						>
-							{$i18n.t('Files')}
-						</button>
-						<button
-							class="px-3 py-1.5 text-xs rounded-lg transition {currentView === 'chunks'
-								? 'bg-gray-200 dark:bg-gray-700 font-semibold'
-								: 'hover:bg-gray-100 dark:hover:bg-gray-800'}"
-							on:click={() => (currentView = 'chunks')}
-						>
-							{$i18n.t('Chunks')}
-						</button>
-					</div>
 				</div>
 			</div>
 
-			{#if fileItems !== null && fileItemsTotal !== null}
+			<!-- AIH-Infra: Files / Chunks Tabs -->
+			<div class="px-3.5 flex gap-2 mb-1">
+				<button
+					class="px-3 py-1 text-xs rounded-lg transition {currentView === 'files' ? 'bg-gray-200 dark:bg-gray-700 font-semibold' : 'hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-500'}"
+					on:click={() => (currentView = 'files')}
+				>
+					{$i18n.t('Files')}
+				</button>
+				<button
+					class="px-3 py-1 text-xs rounded-lg transition {currentView === 'chunks' ? 'bg-gray-200 dark:bg-gray-700 font-semibold' : 'hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-500'}"
+					on:click={() => (currentView = 'chunks')}
+				>
+					{$i18n.t('Chunks')}
+				</button>
+			</div>
+
+			{#if currentView === 'chunks'}
+				<div class="px-3.5 py-2 flex-1 overflow-y-auto">
+					<Chunks knowledgeId={knowledge.id} />
+				</div>
+			{:else if fileItems !== null && fileItemsTotal !== null}
 				<div class="flex flex-row flex-1 gap-3 px-2.5 mt-2">
 					<div class="flex-1 flex">
 						<div class=" flex flex-col w-full space-x-2 rounded-lg h-full">
 							<div class="w-full h-full flex flex-col min-h-full">
-								{#if currentView === 'files'}
-									{#if fileItems.length > 0}
+								{#if fileItems.length > 0}
 									<div class=" flex overflow-y-auto h-full w-full scrollbar-hidden text-xs">
 										<Files
 											files={fileItems}
@@ -1081,11 +1130,6 @@
 										</div>
 									</div>
 								{/if}
-							{:else if currentView === 'chunks'}
-								<div class="h-full overflow-y-auto">
-									<Chunks knowledgeId={knowledge.id} />
-								</div>
-							{/if}
 							</div>
 						</div>
 					</div>
@@ -1105,6 +1149,7 @@
 										<div class="mr-2">
 											<button
 												class="w-full text-left text-sm p-1.5 rounded-lg dark:text-gray-300 dark:hover:text-white hover:bg-black/5 dark:hover:bg-gray-850"
+												aria-label={$i18n.t('Close')}
 												on:click={() => {
 													selectedFileId = null;
 													selectedFile = null;
@@ -1142,6 +1187,7 @@
 											class="w-full h-full text-sm outline-none resize-none px-3 py-2"
 											bind:value={selectedFileContent}
 											disabled={!knowledge?.write_access}
+											aria-label={$i18n.t('File content')}
 											placeholder={$i18n.t('Add content here')}
 										/>
 									{/key}

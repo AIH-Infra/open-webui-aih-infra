@@ -2,12 +2,11 @@
 	import { toast } from 'svelte-sonner';
 
 	import { goto } from '$app/navigation';
-	import { getContext, onMount } from 'svelte';
+	import { getContext } from 'svelte';
 	const i18n = getContext('i18n');
 
 	import { user } from '$lib/stores';
 	import { createNewKnowledge } from '$lib/apis/knowledge';
-	import { getRAGConfig } from '$lib/apis/retrieval';
 
 	import AccessControl from '../common/AccessControl.svelte';
 	import Spinner from '$lib/components/common/Spinner.svelte';
@@ -16,35 +15,11 @@
 
 	let name = '';
 	let description = '';
-	let accessControl = {};
-
-	// RAG chunking parameters
+	let accessGrants = [];
 	let chunkSize = null;
 	let chunkOverlap = null;
-	let textSplitter = '';
-	let enableMarkdownSplitting = '';
-	let showAdvancedSettings = false;
-
-	// Default values from global config
-	let defaultChunkSize = 1000;
-	let defaultChunkOverlap = 100;
-	let defaultTextSplitter = 'character';
-	let defaultEnableMarkdownSplitting = false;
-
-	onMount(async () => {
-		// Fetch global RAG config to show default values
-		try {
-			const config = await getRAGConfig(localStorage.token);
-			if (config) {
-				defaultChunkSize = config.CHUNK_SIZE || 1000;
-				defaultChunkOverlap = config.CHUNK_OVERLAP || 100;
-				defaultTextSplitter = config.TEXT_SPLITTER || 'character';
-				defaultEnableMarkdownSplitting = config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER || false;
-			}
-		} catch (e) {
-			console.error('Failed to fetch RAG config:', e);
-		}
-	});
+	let textSplitter = null;
+	let enableMarkdownSplitting = null;
 
 	const submitHandler = async () => {
 		loading = true;
@@ -61,14 +36,16 @@
 			localStorage.token,
 			name,
 			description,
-			accessControl,
+			accessGrants,
 			chunkSize,
 			chunkOverlap,
-			textSplitter || null,
-			enableMarkdownSplitting === '' ? null : (enableMarkdownSplitting === 'true')
-		).catch((e) => {
-			toast.error(`${e}`);
-		});
+			textSplitter,
+			enableMarkdownSplitting
+		).catch(
+			(e) => {
+				toast.error(`${e}`);
+			}
+		);
 
 		if (res) {
 			toast.success($i18n.t('Knowledge created successfully.'));
@@ -143,120 +120,71 @@
 					</div>
 				</div>
 
-				<!-- Advanced RAG Settings -->
-				<div class="mt-2">
-					<button
-						type="button"
-						class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200"
-						on:click={() => (showAdvancedSettings = !showAdvancedSettings)}
-					>
-						<svg
-							xmlns="http://www.w3.org/2000/svg"
-							viewBox="0 0 20 20"
-							fill="currentColor"
-							class="w-4 h-4 transition-transform {showAdvancedSettings ? 'rotate-90' : ''}"
-						>
-							<path
-								fill-rule="evenodd"
-								d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z"
-								clip-rule="evenodd"
+				<div class="w-full">
+					<div class="text-sm mb-2">{$i18n.t('Chunking Strategy (Optional)')}</div>
+					<div class="grid grid-cols-2 gap-2 mb-2">
+						<div>
+							<label class="text-xs text-gray-500 dark:text-gray-400">{$i18n.t('Chunk Size')}</label>
+							<input
+								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
+								type="number"
+								bind:value={chunkSize}
+								placeholder={$i18n.t('Default')}
+								min="100"
 							/>
-						</svg>
-						<span>{$i18n.t('Advanced RAG Settings (Optional)')}</span>
-					</button>
-
-					{#if showAdvancedSettings}
-						<div class="mt-3 space-y-3 p-4 bg-gray-50 dark:bg-gray-850 rounded-lg">
-							<div class="text-xs text-gray-500 dark:text-gray-400 mb-2">
-								{$i18n.t(
-									'Configure chunking parameters for this knowledge base. Leave empty to use global defaults.'
-								)}
-							</div>
-
-							<div class="grid grid-cols-2 gap-3">
-								<div>
-									<label class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1 block">
-										{$i18n.t('Chunk Size')}
-										<span class="text-gray-500 dark:text-gray-400 font-normal">
-											(default: {defaultChunkSize})
-										</span>
-									</label>
-									<input
-										type="number"
-										class="w-full rounded-lg py-2 px-3 text-sm bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 outline-hidden"
-										bind:value={chunkSize}
-										placeholder={defaultChunkSize.toString()}
-										min="1"
-										max="100000"
-									/>
-								</div>
-
-								<div>
-									<label class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1 block">
-										{$i18n.t('Chunk Overlap')}
-										<span class="text-gray-500 dark:text-gray-400 font-normal">
-											(default: {defaultChunkOverlap})
-										</span>
-									</label>
-									<input
-										type="number"
-										class="w-full rounded-lg py-2 px-3 text-sm bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 outline-hidden"
-										bind:value={chunkOverlap}
-										placeholder={defaultChunkOverlap.toString()}
-										min="0"
-										max="10000"
-									/>
-								</div>
-							</div>
-
-							<div>
-								<label class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1 block">
-									{$i18n.t('Enable Markdown Header Splitting')}
-									<span class="text-gray-500 dark:text-gray-400 font-normal">
-										(default: {defaultEnableMarkdownSplitting ? 'Enabled' : 'Disabled'})
-									</span>
-								</label>
-								<select
-									class="w-full rounded-lg py-2 px-3 text-sm bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 outline-hidden"
-									bind:value={enableMarkdownSplitting}
-								>
-									<option value="">{$i18n.t('Use Global Default')}</option>
-									<option value="true">{$i18n.t('Enable')}</option>
-									<option value="false">{$i18n.t('Disable')}</option>
-								</select>
-								<p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-									{$i18n.t('Split documents by markdown headers (#, ##, ###) before chunking')}
-								</p>
-							</div>
-
-							<div>
-								<label class="text-xs font-medium text-gray-700 dark:text-gray-300 mb-1 block">
-									{$i18n.t('Text Splitter')}
-									<span class="text-gray-500 dark:text-gray-400 font-normal">
-										(default: {defaultTextSplitter})
-									</span>
-								</label>
-								<select
-									class="w-full rounded-lg py-2 px-3 text-sm bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 outline-hidden"
-									bind:value={textSplitter}
-								>
-									<option value="">{$i18n.t('Use Global Default')}</option>
-									<option value="character">{$i18n.t('Character')}</option>
-									<option value="token">{$i18n.t('Token (Tiktoken)')}</option>
-								</select>
-							</div>
+							<div class="text-xs text-gray-500 mt-1">{$i18n.t('Recommended not to exceed embedding model context limit (typically 8192 tokens)')}</div>
 						</div>
-					{/if}
+						<div>
+							<label class="text-xs text-gray-500 dark:text-gray-400">{$i18n.t('Chunk Overlap')}</label>
+							<input
+								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
+								type="number"
+								bind:value={chunkOverlap}
+								placeholder={$i18n.t('Default')}
+								min="0"
+							/>
+							<div class="text-xs text-gray-500 mt-1">{$i18n.t('Recommended to set as 1/8 to 1/10 of Chunk Size')}</div>
+						</div>
+					</div>
+					<div class="grid grid-cols-2 gap-2">
+						<div>
+							<label class="text-xs text-gray-500 dark:text-gray-400">{$i18n.t('Markdown Splitting')}</label>
+							<select
+								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
+								bind:value={enableMarkdownSplitting}
+							>
+								<option value={null}>{$i18n.t('Default')}</option>
+								<option value={true}>{$i18n.t('Enable')}</option>
+								<option value={false}>{$i18n.t('Disable')}</option>
+							</select>
+						</div>
+						<div>
+							<label class="text-xs text-gray-500 dark:text-gray-400">{$i18n.t('Secondary Splitter')}</label>
+							<select
+								class="w-full rounded-lg py-2 px-4 text-sm bg-gray-50 dark:text-gray-300 dark:bg-gray-850 outline-hidden"
+								bind:value={textSplitter}
+							>
+								<option value={null}>{$i18n.t('Default')}</option>
+								<option value="token">Token</option>
+								<option value="character">Character</option>
+							</select>
+						</div>
+					</div>
+					<div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+						{$i18n.t('Markdown header splitting is applied first, then oversized chunks are split using the secondary splitter.')}
+					</div>
 				</div>
 			</div>
 		</div>
 
 		<div class="mt-2">
 			<AccessControl
-				bind:accessControl
+				bind:accessGrants
 				accessRoles={['read', 'write']}
 				share={$user?.permissions?.sharing?.knowledge || $user?.role === 'admin'}
 				sharePublic={$user?.permissions?.sharing?.public_knowledge || $user?.role === 'admin'}
+				shareUsers={($user?.permissions?.access_grants?.allow_users ?? true) ||
+					$user?.role === 'admin'}
 			/>
 		</div>
 
