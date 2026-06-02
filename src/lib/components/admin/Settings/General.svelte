@@ -1,7 +1,7 @@
 <script lang="ts">
-	import DOMPurify from 'dompurify';
+	import { v4 as uuidv4 } from 'uuid';
 
-	import { getVersionUpdates, getWebhookUrl, updateWebhookUrl } from '$lib/apis';
+	import { getBackendConfig, getWebhookUrl, updateWebhookUrl } from '$lib/apis';
 	import {
 		getAdminConfig,
 		getLdapConfig,
@@ -10,30 +10,28 @@
 		updateLdapConfig,
 		updateLdapServer
 	} from '$lib/apis/auths';
+	import { getBanners, setBanners } from '$lib/apis/configs';
 	import { getGroups } from '$lib/apis/groups';
 	import SensitiveInput from '$lib/components/common/SensitiveInput.svelte';
 	import Switch from '$lib/components/common/Switch.svelte';
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
 	import { WEBUI_BUILD_HASH, WEBUI_VERSION } from '$lib/constants';
-	import { config, showChangelog } from '$lib/stores';
-	import { compareVersion } from '$lib/utils';
+	import { banners as _banners, config } from '$lib/stores';
+	import type { Banner } from '$lib/types';
 	import { onMount, getContext } from 'svelte';
 	import { toast } from 'svelte-sonner';
 	import Textarea from '$lib/components/common/Textarea.svelte';
+	import Banners from './Interface/Banners.svelte';
 
 	const i18n = getContext('i18n');
 
 	export let saveHandler: Function;
 
-	let updateAvailable = null;
-	let version = {
-		current: '',
-		latest: ''
-	};
-
 	let adminConfig = null;
 	let webhookUrl = '';
 	let groups = [];
+
+	let banners: Banner[] = [];
 
 	// LDAP
 	let ENABLE_LDAP = false;
@@ -52,21 +50,6 @@
 		ciphers: ''
 	};
 
-	const checkForVersionUpdates = async () => {
-		updateAvailable = null;
-		version = await getVersionUpdates(localStorage.token).catch((error) => {
-			return {
-				current: WEBUI_VERSION,
-				latest: WEBUI_VERSION
-			};
-		});
-
-		console.info(version);
-
-		updateAvailable = compareVersion(version.latest, version.current);
-		console.info(updateAvailable);
-	};
-
 	const updateLdapServerHandler = async () => {
 		if (!ENABLE_LDAP) return;
 		const res = await updateLdapServer(localStorage.token, LDAP_SERVER).catch((error) => {
@@ -78,11 +61,19 @@
 		}
 	};
 
+	const updateBanners = async () => {
+		_banners.set(await setBanners(localStorage.token, banners));
+	};
+
 	const updateHandler = async () => {
 		webhookUrl = await updateWebhookUrl(localStorage.token, webhookUrl);
 		const res = await updateAdminConfig(localStorage.token, adminConfig);
 		await updateLdapConfig(localStorage.token, ENABLE_LDAP);
 		await updateLdapServerHandler();
+
+		await updateBanners();
+
+		await config.set(await getBackendConfig());
 
 		if (res) {
 			saveHandler();
@@ -92,10 +83,6 @@
 	};
 
 	onMount(async () => {
-		if ($config?.features?.enable_version_update_check) {
-			checkForVersionUpdates();
-		}
-
 		await Promise.all([
 			(async () => {
 				adminConfig = await getAdminConfig(localStorage.token);
@@ -114,6 +101,8 @@
 
 		const ldapConfig = await getLdapConfig(localStorage.token);
 		ENABLE_LDAP = ldapConfig.ENABLE_LDAP;
+
+		banners = await getBanners(localStorage.token);
 	});
 </script>
 
@@ -131,155 +120,51 @@
 
 					<hr class=" border-gray-100/30 dark:border-gray-850/30 my-2" />
 
-					<div class="mb-2.5">
-						<div class=" mb-1 text-xs font-medium flex space-x-2 items-center">
-							<div>
-								{$i18n.t('Version')}
-							</div>
-						</div>
-						<div class="flex w-full justify-between items-center">
-							<div class="flex flex-col text-xs text-gray-700 dark:text-gray-200">
-								<div class="flex gap-1">
+					<div class="mb-2.5 space-y-3 text-xs text-gray-700 dark:text-gray-200">
+						<div>
+							<div class="mb-1 text-xs font-medium">{$i18n.t('Version')}</div>
+							<div class="space-y-1">
+								<div class="font-medium text-sm text-gray-900 dark:text-white">AIH-Infra v1.0</div>
+								<div>
+									Based on Open WebUI
 									<Tooltip content={WEBUI_BUILD_HASH}>
 										v{WEBUI_VERSION}
 									</Tooltip>
-
-									{#if $config?.features?.enable_version_update_check}
-										<a
-											href="https://github.com/open-webui/open-webui/releases/tag/v{version.latest}"
-											target="_blank"
-										>
-											{updateAvailable === null
-												? $i18n.t('Checking for updates...')
-												: updateAvailable
-													? `(v${version.latest} ${$i18n.t('available!')})`
-													: $i18n.t('(latest)')}
-										</a>
-									{/if}
 								</div>
-
-								<button
-									class=" underline flex items-center space-x-1 text-xs text-gray-500 dark:text-gray-500"
-									type="button"
-									on:click={() => {
-										showChangelog.set(true);
-									}}
-								>
-									<div>{$i18n.t("See what's new")}</div>
-								</button>
 							</div>
-
-							{#if $config?.features?.enable_version_update_check}
-								<button
-									class=" text-xs px-3 py-1.5 bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition rounded-lg font-medium"
-									type="button"
-									on:click={() => {
-										checkForVersionUpdates();
-									}}
-								>
-									{$i18n.t('Check for updates')}
-								</button>
-							{/if}
 						</div>
-					</div>
 
-					<div class="mb-2.5">
-						<div class="flex w-full justify-between items-center">
-							<div class="text-xs pr-2">
-								<div class="">
-									{$i18n.t('Help')}
-								</div>
-								<div class=" text-xs text-gray-500">
-									{$i18n.t('Discover how to use Open WebUI and seek support from the community.')}
-								</div>
+						<div>
+							<div class="mb-1 text-xs font-medium">{$i18n.t('Help')}</div>
+							<div class="text-gray-500 dark:text-gray-400">Maintained by AIH-Infra.</div>
+							<div class="text-gray-500 dark:text-gray-400">
+								AIH-Infra customization contributions by Güriedrich &amp; Baireinhold.
 							</div>
-
-							<a
-								class="flex-shrink-0 text-xs font-medium underline"
-								href="https://docs.openwebui.com/"
-								target="_blank"
-							>
-								{$i18n.t('Documentation')}
+							<a class="underline text-gray-500 dark:text-gray-400" href="https://github.com/AIH-Infra/open-webui-aih-infra" target="_blank">
+								AIH-Infra repository
 							</a>
 						</div>
 
-						<div class="mt-1">
-							<div class="flex space-x-1">
-								<a href="https://discord.gg/5rJgQTnV4s" target="_blank">
-									<img
-										alt="Discord"
-										src="https://img.shields.io/badge/Discord-Open_WebUI-blue?logo=discord&logoColor=white"
-									/>
+						<div>
+							<div class="mb-1 text-xs font-medium">Upstream project resources</div>
+							<div class="flex flex-col gap-1">
+								<a class="underline text-gray-500 dark:text-gray-400" href="https://docs.openwebui.com/" target="_blank">
+									Open WebUI upstream documentation
 								</a>
-
-								<a href="https://twitter.com/OpenWebUI" target="_blank">
-									<img
-										alt="X (formerly Twitter) Follow"
-										src="https://img.shields.io/twitter/follow/OpenWebUI"
-									/>
-								</a>
-
-								<a href="https://github.com/open-webui/open-webui" target="_blank">
-									<img
-										alt="Github Repo"
-										src="https://img.shields.io/github/stars/open-webui/open-webui?style=social&label=Star us on Github"
-									/>
+								<a class="underline text-gray-500 dark:text-gray-400" href="https://github.com/open-webui/open-webui" target="_blank">
+									Open WebUI upstream repository
 								</a>
 							</div>
 						</div>
-					</div>
 
-					<div class="mb-2.5">
-						<div class="flex w-full justify-between items-center">
-							<div class="text-xs pr-2">
-								<div class="">
-									{$i18n.t('License')}
-								</div>
-
-								{#if $config?.license_metadata}
-									<a
-										href="https://docs.openwebui.com/enterprise"
-										target="_blank"
-										class="text-gray-500 mt-0.5"
-									>
-										<span class=" capitalize text-black dark:text-white"
-											>{$config?.license_metadata?.type}
-											license</span
-										>
-										registered to
-										<span class=" capitalize text-black dark:text-white"
-											>{$config?.license_metadata?.organization_name}</span
-										>
-										for
-										<span class=" font-medium text-black dark:text-white"
-											>{$config?.license_metadata?.seats ?? 'Unlimited'} users.</span
-										>
-									</a>
-									{#if $config?.license_metadata?.html}
-										<div class="mt-0.5">
-											{@html DOMPurify.sanitize($config?.license_metadata?.html)}
-										</div>
-									{/if}
-								{:else}
-									<a
-										class=" text-xs hover:underline"
-										href="https://docs.openwebui.com/enterprise"
-										target="_blank"
-									>
-										<span class="text-gray-500">
-											{$i18n.t(
-												'Upgrade to a licensed plan for enhanced capabilities, including custom theming and branding, and dedicated support.'
-											)}
-										</span>
-									</a>
-								{/if}
+						<div>
+							<div class="mb-1 text-xs font-medium">Upstream copyright notice</div>
+							<div class="text-gray-500 dark:text-gray-400">
+								Copyright (c) 2023- Open WebUI Inc. All rights reserved.
 							</div>
-
-							<!-- <button
-								class="flex-shrink-0 text-xs px-3 py-1.5 bg-gray-50 hover:bg-gray-100 dark:bg-gray-850 dark:hover:bg-gray-800 transition rounded-lg font-medium"
-							>
-								{$i18n.t('Activate')}
-							</button> -->
+							<div class="text-gray-500 dark:text-gray-400">
+								Created by Timothy Jaeryang Baek.
+							</div>
 						</div>
 					</div>
 				</div>
@@ -293,7 +178,7 @@
 						<div class=" self-center text-xs font-medium">{$i18n.t('Default User Role')}</div>
 						<div class="flex items-center relative">
 							<select
-								class="dark:bg-gray-900 w-fit pr-8 rounded-sm px-2 text-xs bg-transparent outline-hidden text-right"
+								class="w-fit pr-8 rounded-sm px-2 text-xs bg-transparent outline-hidden text-right"
 								bind:value={adminConfig.DEFAULT_USER_ROLE}
 								placeholder={$i18n.t('Select a role')}
 							>
@@ -308,7 +193,7 @@
 						<div class=" self-center text-xs font-medium">{$i18n.t('Default Group')}</div>
 						<div class="flex items-center relative">
 							<select
-								class="dark:bg-gray-900 w-fit pr-8 rounded-sm px-2 text-xs bg-transparent outline-hidden text-right"
+								class="w-fit pr-8 rounded-sm px-2 text-xs bg-transparent outline-hidden text-right"
 								bind:value={adminConfig.DEFAULT_GROUP_ID}
 								placeholder={$i18n.t('Select a group')}
 							>
@@ -404,9 +289,8 @@
 								/>
 
 								<div class="mt-2 text-xs text-gray-400 dark:text-gray-500">
-									<!-- https://docs.openwebui.com/getting-started/advanced-topics/api-endpoints -->
 									<a
-										href="https://docs.openwebui.com/getting-started/api-endpoints"
+										href="https://docs.openwebui.com/reference/api-endpoints"
 										target="_blank"
 										class=" text-gray-300 font-medium underline"
 									>
@@ -447,7 +331,7 @@
 										<span class=" font-medium">{$i18n.t('Warning')}:</span>
 										<span
 											><a
-												href="https://docs.openwebui.com/getting-started/env-configuration#jwt_expires_in"
+												href="https://docs.openwebui.com/reference/env-configuration#jwt_expires_in"
 												target="_blank"
 												class=" underline"
 												>{$i18n.t('No expiration can pose security risks.')}
@@ -526,7 +410,6 @@
 											>
 												<input
 													class="w-full bg-transparent outline-hidden py-0.5"
-													required
 													placeholder={$i18n.t('Enter Application DN')}
 													bind:value={LDAP_SERVER.app_dn}
 												/>
@@ -538,6 +421,7 @@
 											</div>
 											<SensitiveInput
 												placeholder={$i18n.t('Enter Application DN Password')}
+												required={false}
 												bind:value={LDAP_SERVER.app_dn_password}
 											/>
 										</div>
@@ -809,6 +693,53 @@
 								bind:value={webhookUrl}
 							/>
 						</div>
+					</div>
+				</div>
+
+				<div class="mb-3.5">
+					<div class=" mt-0.5 mb-2.5 text-base font-medium">{$i18n.t('UI')}</div>
+
+					<hr class=" border-gray-100/30 dark:border-gray-850/30 my-2" />
+
+					<div class="mb-2.5">
+						<div class="flex w-full justify-between">
+							<div class=" self-center text-xs">
+								{$i18n.t('Banners')}
+							</div>
+
+							<button
+								class="p-1 px-3 text-xs flex rounded-sm transition"
+								type="button"
+								on:click={() => {
+									if (banners.length === 0 || banners.at(-1).content !== '') {
+										banners = [
+											...banners,
+											{
+												id: uuidv4(),
+												type: '',
+												title: '',
+												content: '',
+												dismissible: true,
+												timestamp: Math.floor(Date.now() / 1000)
+											}
+										];
+									}
+								}}
+							>
+								<svg
+									xmlns="http://www.w3.org/2000/svg"
+									viewBox="0 0 20 20"
+									fill="currentColor"
+									class="w-4 h-4"
+								>
+									<path
+										d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z"
+									/>
+								</svg>
+							</button>
+						</div>
+
+						<Banners bind:banners />
 					</div>
 				</div>
 			</div>
