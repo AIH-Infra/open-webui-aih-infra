@@ -2,6 +2,7 @@
 	import { DropdownMenu } from 'bits-ui';
 	import { flyAndScale } from '$lib/utils/transitions';
 	import { getContext, createEventDispatcher, tick } from 'svelte';
+	import { toast } from 'svelte-sonner';
 
 	import fileSaver from 'file-saver';
 	const { saveAs } = fileSaver;
@@ -30,7 +31,7 @@
 	import Folder from '$lib/components/icons/Folder.svelte';
 	import Messages from '$lib/components/chat/Messages.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n = getContext<any>('i18n');
 
 	export let shareHandler: Function;
 	export let moveChatHandler: Function;
@@ -46,7 +47,9 @@
 	let show = false;
 	let pinned = false;
 
-	let chat = null;
+	let chat: any = null;
+	let downloadDataLoading = false;
+	let downloadDataLoadedForChatId: string | null = null;
 	let showFullMessages = false;
 
 	const pinHandler = async () => {
@@ -58,23 +61,49 @@
 		pinned = await getChatPinnedStatusById(localStorage.token, chatId);
 	};
 
-	const getChatAsText = async (chat) => {
+	const getChatAsText = (chat: any) => {
 		const history = chat.chat.history;
 		const messages = createMessagesList(history, history.currentId);
-		const chatText = messages.reduce((a, message, i, arr) => {
+		const chatText = messages.reduce((a: string, message: any) => {
 			return `${a}### ${message.role.toUpperCase()}\n${message.content}\n\n`;
 		}, '');
 
 		return chatText.trim();
 	};
 
-	const downloadTxt = async () => {
-		const chat = await getChatById(localStorage.token, chatId);
-		if (!chat) {
+	const ensureDownloadDataReady = async () => {
+		if (!chatId) {
+			return null;
+		}
+
+		if (downloadDataLoadedForChatId === chatId && chat) {
+			return chat;
+		}
+
+		if (downloadDataLoading) {
+			return null;
+		}
+
+		downloadDataLoading = true;
+		try {
+			const loadedChat = await getChatById(localStorage.token, chatId);
+			if (loadedChat) {
+				chat = loadedChat;
+				downloadDataLoadedForChatId = chatId;
+			}
+			return loadedChat;
+		} finally {
+			downloadDataLoading = false;
+		}
+	};
+
+	const downloadTxt = () => {
+		if (downloadDataLoading || downloadDataLoadedForChatId !== chatId || !chat) {
+			toast.info($i18n.t('Preparing download'));
 			return;
 		}
 
-		const chatText = await getChatAsText(chat);
+		const chatText = getChatAsText(chat);
 		let blob = new Blob([chatText], {
 			type: 'text/plain'
 		});
@@ -187,7 +216,15 @@
 						page++;
 					}
 
-					pdf.save(`chat-${chat.chat.title}.pdf`);
+					const pdfBlob = pdf.output('blob');
+					const pdfUrl = URL.createObjectURL(pdfBlob);
+					const a = document.createElement('a');
+					a.href = pdfUrl;
+					a.download = `chat-${chat.chat.title}.pdf`;
+					document.body.appendChild(a);
+					a.click();
+					document.body.removeChild(a);
+					setTimeout(() => URL.revokeObjectURL(pdfUrl), 100);
 
 					showFullMessages = false;
 				} catch (error) {
@@ -197,7 +234,7 @@
 		} else {
 			console.log('Downloading PDF');
 
-			const chatText = await getChatAsText(chat);
+			const chatText = getChatAsText(chat);
 
 			const doc = new jsPDF();
 
@@ -239,23 +276,33 @@
 				y += lineHeight * 0.1;
 			}
 
-			doc.save(`chat-${chat.chat.title}.pdf`);
+			const pdfBlob = doc.output('blob');
+			const pdfUrl = URL.createObjectURL(pdfBlob);
+			const a = document.createElement('a');
+			a.href = pdfUrl;
+			a.download = `chat-${chat.chat.title}.pdf`;
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			setTimeout(() => URL.revokeObjectURL(pdfUrl), 100);
 		}
 	};
 
-	const downloadJSONExport = async () => {
-		const chat = await getChatById(localStorage.token, chatId);
-
-		if (chat) {
-			let blob = new Blob([JSON.stringify([chat])], {
-				type: 'application/json'
-			});
-			saveAs(blob, `chat-export-${Date.now()}.json`);
+	const downloadJSONExport = () => {
+		if (downloadDataLoading || downloadDataLoadedForChatId !== chatId || !chat) {
+			toast.info($i18n.t('Preparing download'));
+			return;
 		}
+
+		let blob = new Blob([JSON.stringify([chat])], {
+			type: 'application/json'
+		});
+		saveAs(blob, `chat-export-${Date.now()}.json`);
 	};
 
 	$: if (show) {
 		checkPinned();
+		ensureDownloadDataReady();
 	}
 </script>
 
@@ -294,7 +341,7 @@
 
 	<div slot="content">
 		<DropdownMenu.Content
-			class="w-full max-w-[200px] rounded-2xl px-1 py-1  border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg transition"
+			class="select-none w-full max-w-[200px] rounded-2xl px-1 py-1  border border-gray-100  dark:border-gray-800 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg transition"
 			sideOffset={-2}
 			side="bottom"
 			align="start"
@@ -302,6 +349,7 @@
 		>
 			{#if $user?.role === 'admin' || ($user.permissions?.chat?.share ?? true)}
 				<DropdownMenu.Item
+					draggable="false"
 					class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800  rounded-xl"
 					on:click={() => {
 						shareHandler();
@@ -314,6 +362,7 @@
 
 			<DropdownMenu.Sub>
 				<DropdownMenu.SubTrigger
+					draggable="false"
 					class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 				>
 					<Download strokeWidth="1.5" />
@@ -321,12 +370,13 @@
 					<div class="flex items-center">{$i18n.t('Download')}</div>
 				</DropdownMenu.SubTrigger>
 				<DropdownMenu.SubContent
-					class="w-full rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg border border-gray-100  dark:border-gray-800"
+					class="select-none w-full rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg border border-gray-100  dark:border-gray-800"
 					transition={flyAndScale}
 					sideOffset={8}
 				>
 					{#if $user?.role === 'admin' || ($user.permissions?.chat?.export ?? true)}
 						<DropdownMenu.Item
+							draggable="false"
 							class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 							on:click={() => {
 								downloadJSONExport();
@@ -337,6 +387,7 @@
 					{/if}
 
 					<DropdownMenu.Item
+						draggable="false"
 						class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 						on:click={() => {
 							downloadTxt();
@@ -346,6 +397,7 @@
 					</DropdownMenu.Item>
 
 					<DropdownMenu.Item
+						draggable="false"
 						class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl select-none w-full"
 						on:click={() => {
 							downloadPdf();
@@ -357,6 +409,7 @@
 			</DropdownMenu.Sub>
 
 			<DropdownMenu.Item
+				draggable="false"
 				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 				on:click={() => {
 					renameHandler();
@@ -369,6 +422,7 @@
 			<hr class="border-gray-50/30 dark:border-gray-800/30 my-1" />
 
 			<DropdownMenu.Item
+				draggable="false"
 				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 				on:click={() => {
 					pinHandler();
@@ -384,6 +438,7 @@
 			</DropdownMenu.Item>
 
 			<DropdownMenu.Item
+				draggable="false"
 				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 				on:click={() => {
 					cloneChatHandler();
@@ -396,6 +451,7 @@
 			{#if chatId && $folders.length > 0}
 				<DropdownMenu.Sub>
 					<DropdownMenu.SubTrigger
+						draggable="false"
 						class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl select-none w-full"
 					>
 						<Folder />
@@ -403,20 +459,23 @@
 						<div class="flex items-center">{$i18n.t('Move')}</div>
 					</DropdownMenu.SubTrigger>
 					<DropdownMenu.SubContent
-						class="w-full rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white border border-gray-100  dark:border-gray-800 shadow-lg max-h-52 overflow-y-auto scrollbar-hidden"
+						class="select-none w-full max-w-[200px] rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white border border-gray-100  dark:border-gray-800 shadow-lg max-h-52 overflow-y-auto scrollbar-hidden"
 						transition={flyAndScale}
 						sideOffset={8}
 					>
 						{#each $folders.sort((a, b) => b.updated_at - a.updated_at) as folder}
 							<DropdownMenu.Item
-								class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
+								draggable="false"
+								class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl overflow-hidden"
 								on:click={() => {
 									moveChatHandler(chatId, folder.id);
 								}}
 							>
-								<Folder />
+								<div class="shrink-0">
+									<Folder />
+								</div>
 
-								<div class="flex items-center">{folder?.name ?? 'Folder'}</div>
+								<div class="truncate">{folder?.name ?? 'Folder'}</div>
 							</DropdownMenu.Item>
 						{/each}
 					</DropdownMenu.SubContent>
@@ -424,6 +483,7 @@
 			{/if}
 
 			<DropdownMenu.Item
+				draggable="false"
 				class="flex gap-2 items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 				on:click={() => {
 					archiveChatHandler();
@@ -434,6 +494,7 @@
 			</DropdownMenu.Item>
 
 			<DropdownMenu.Item
+				draggable="false"
 				class="flex  gap-2  items-center px-3 py-1.5 text-sm  cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl"
 				on:click={() => {
 					deleteHandler();
