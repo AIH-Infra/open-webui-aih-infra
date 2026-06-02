@@ -29,9 +29,9 @@ from open_webui.models.knowledge import Knowledges
 
 from open_webui.models.chats import Chats
 from open_webui.models.notes import Notes
+from open_webui.models.access_grants import AccessGrants
 
 from open_webui.retrieval.vector.main import GetResult
-from open_webui.utils.access_control import has_access
 from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.misc import get_message_list
 
@@ -88,10 +88,19 @@ def get_content_from_url(request, url: str) -> str:
     return content, docs
 
 
+CHUNK_HASH_KEY = "_chunk_hash"
+
+
+def _content_hash(text: str) -> str:
+    """SHA-256 hash of text, used as a stable chunk identifier for RRF dedup."""
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
 class VectorSearchRetriever(BaseRetriever):
     collection_name: Any
     embedding_function: Any
     top_k: int
+    filter: Optional[dict] = None
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
@@ -118,6 +127,7 @@ class VectorSearchRetriever(BaseRetriever):
             collection_name=self.collection_name,
             vectors=[embedding],
             limit=self.top_k,
+            filter=self.filter,
         )
 
         ids = result.ids[0]
@@ -126,9 +136,11 @@ class VectorSearchRetriever(BaseRetriever):
 
         results = []
         for idx in range(len(ids)):
+            metadata = metadatas[idx]
+            metadata[CHUNK_HASH_KEY] = _content_hash(documents[idx])
             results.append(
                 Document(
-                    metadata=metadatas[idx],
+                    metadata=metadata,
                     page_content=documents[idx],
                 )
             )
@@ -136,15 +148,18 @@ class VectorSearchRetriever(BaseRetriever):
 
 
 def query_doc(
-    collection_name: str, query_embedding: list[float], k: int, user: UserModel = None
+    collection_name: str, query_embedding: list[float], k: int, filter: dict = None, user: UserModel = None
 ):
     try:
         log.debug(f"query_doc:doc {collection_name}")
-        result = VECTOR_DB_CLIENT.search(
-            collection_name=collection_name,
-            vectors=[query_embedding],
-            limit=k,
-        )
+        search_params = {
+            "collection_name": collection_name,
+            "vectors": [query_embedding],
+            "limit": k,
+        }
+        if filter:
+            search_params["filter"] = filter
+        result = VECTOR_DB_CLIENT.search(**search_params)
 
         if result:
             log.info(f"query_doc:result {result.ids} {result.metadatas}")
@@ -218,6 +233,8 @@ async def query_doc_with_hybrid_search(
     r: float,
     hybrid_bm25_weight: float,
     enable_enriched_texts: bool = False,
+    filter: Optional[dict] = None,
+    rerank: bool = True,
 ) -> dict:
     try:
         # First check if collection_result has the required attributes
@@ -240,15 +257,21 @@ async def query_doc_with_hybrid_search(
 
         log.debug(f"query_doc_with_hybrid_search:doc {collection_name}")
 
+        original_texts = collection_result.documents[0]
+        bm25_metadatas = [
+            {**meta, CHUNK_HASH_KEY: _content_hash(original_texts[idx])}
+            for idx, meta in enumerate(collection_result.metadatas[0])
+        ]
+
         bm25_texts = (
             get_enriched_texts(collection_result)
             if enable_enriched_texts
-            else collection_result.documents[0]
+            else original_texts
         )
 
         bm25_retriever = BM25Retriever.from_texts(
             texts=bm25_texts,
-            metadatas=collection_result.metadatas[0],
+            metadatas=bm25_metadatas,
         )
         bm25_retriever.k = k
 
@@ -256,50 +279,65 @@ async def query_doc_with_hybrid_search(
             collection_name=collection_name,
             embedding_function=embedding_function,
             top_k=k,
+            filter=filter,
         )
 
+        # Use CHUNK_HASH_KEY for dedup so enriched BM25 texts don't defeat RRF
         if hybrid_bm25_weight <= 0:
             ensemble_retriever = EnsembleRetriever(
-                retrievers=[vector_search_retriever], weights=[1.0]
+                retrievers=[vector_search_retriever],
+                weights=[1.0],
+                id_key=CHUNK_HASH_KEY,
             )
         elif hybrid_bm25_weight >= 1:
             ensemble_retriever = EnsembleRetriever(
-                retrievers=[bm25_retriever], weights=[1.0]
+                retrievers=[bm25_retriever],
+                weights=[1.0],
+                id_key=CHUNK_HASH_KEY,
             )
         else:
             ensemble_retriever = EnsembleRetriever(
                 retrievers=[bm25_retriever, vector_search_retriever],
                 weights=[hybrid_bm25_weight, 1.0 - hybrid_bm25_weight],
+                id_key=CHUNK_HASH_KEY,
             )
 
-        compressor = RerankCompressor(
-            embedding_function=embedding_function,
-            top_n=k_reranker,
-            reranking_function=reranking_function,
-            r_score=r,
-        )
-
-        compression_retriever = ContextualCompressionRetriever(
-            base_compressor=compressor, base_retriever=ensemble_retriever
-        )
-
-        result = await compression_retriever.ainvoke(query)
-
-        distances = [d.metadata.get("score") for d in result]
-        documents = [d.page_content for d in result]
-        metadatas = [d.metadata for d in result]
-
-        # retrieve only min(k, k_reranker) items, sort and cut by distance if k < k_reranker
-        if k < k_reranker:
-            sorted_items = sorted(
-                zip(distances, metadatas, documents), key=lambda x: x[0], reverse=True
+        if rerank:
+            compressor = RerankCompressor(
+                embedding_function=embedding_function,
+                top_n=k_reranker,
+                reranking_function=reranking_function,
+                r_score=r,
             )
-            sorted_items = sorted_items[:k]
 
-            if sorted_items:
-                distances, documents, metadatas = map(list, zip(*sorted_items))
-            else:
-                distances, documents, metadatas = [], [], []
+            compression_retriever = ContextualCompressionRetriever(
+                base_compressor=compressor, base_retriever=ensemble_retriever
+            )
+
+            result = await compression_retriever.ainvoke(query)
+
+            distances = [d.metadata.get("score") for d in result]
+            documents = [d.page_content for d in result]
+            metadatas = [d.metadata for d in result]
+
+            # retrieve only min(k, k_reranker) items, sort and cut by distance if k < k_reranker
+            if k < k_reranker:
+                sorted_items = sorted(
+                    zip(distances, documents, metadatas), key=lambda x: x[0], reverse=True
+                )
+                sorted_items = sorted_items[:k]
+
+                if sorted_items:
+                    distances, documents, metadatas = map(list, zip(*sorted_items))
+                else:
+                    distances, documents, metadatas = [], [], []
+        else:
+            result = await ensemble_retriever.ainvoke(query)
+            distances = [
+                d.metadata.get("score", d.metadata.get("rrf_score", 0.0)) for d in result
+            ]
+            documents = [d.page_content for d in result]
+            metadatas = [d.metadata for d in result]
 
         result = {
             "distances": [distances],
@@ -338,7 +376,7 @@ def merge_get_results(get_results: list[dict]) -> dict:
     return result
 
 
-def merge_and_sort_query_results(query_results: list[dict], k: Optional[int]) -> dict:
+def merge_and_sort_query_results(query_results: list[dict], k: Optional[int] = None) -> dict:
     # Initialize lists to store combined data
     combined = dict()  # To store documents with unique document hashes
 
@@ -372,16 +410,11 @@ def merge_and_sort_query_results(query_results: list[dict], k: Optional[int]) ->
     # Sort the list based on distances
     combined.sort(key=lambda x: x[0], reverse=True)
 
-    # Slice to keep only the top k elements (if k is specified)
-    # If k is None, return all results
-    if k is not None:
-        sorted_distances, sorted_documents, sorted_metadatas = (
-            zip(*combined[:k]) if combined else ([], [], [])
-        )
-    else:
-        sorted_distances, sorted_documents, sorted_metadatas = (
-            zip(*combined) if combined else ([], [], [])
-        )
+    limited_combined = combined[:k] if k and k > 0 else combined
+
+    sorted_distances, sorted_documents, sorted_metadatas = (
+        zip(*limited_combined) if limited_combined else ([], [], [])
+    )
 
     # Create and return the output dictionary
     return {
@@ -413,7 +446,7 @@ async def query_collection(
     queries: list[str],
     embedding_function,
     k: int,
-    global_top_k: bool = True,
+    filter: dict = None,  # AIH-Infra: Add filter support for file-level filtering
 ) -> dict:
     results = []
     error = False
@@ -425,6 +458,7 @@ async def query_collection(
                     collection_name=collection_name,
                     k=k,
                     query_embedding=query_embedding,
+                    filter=filter,  # AIH-Infra: Pass filter for file-level filtering
                 )
                 if result is not None:
                     return result.model_dump(), None
@@ -460,12 +494,7 @@ async def query_collection(
     if error and not results:
         log.warning("All collection queries failed. No results returned.")
 
-    # If global_top_k is True, merge and sort all results, then take top k
-    # If global_top_k is False, return all results (each source already returned k)
-    if global_top_k:
-        return merge_and_sort_query_results(results, k=k)
-    else:
-        return merge_and_sort_query_results(results, k=None)  # No limit, return all
+    return merge_and_sort_query_results(results, k=k)
 
 
 async def query_collection_with_hybrid_search(
@@ -478,7 +507,9 @@ async def query_collection_with_hybrid_search(
     r: float,
     hybrid_bm25_weight: float,
     enable_enriched_texts: bool = False,
+    filter: Optional[dict] = None,
     global_top_k: bool = True,
+    rerank: bool = True,
 ) -> dict:
     results = []
     error = False
@@ -488,11 +519,17 @@ async def query_collection_with_hybrid_search(
     for collection_name in collection_names:
         try:
             log.debug(
-                f"query_collection_with_hybrid_search:VECTOR_DB_CLIENT.get:collection {collection_name}"
+                f"query_collection_with_hybrid_search:prefetch collection {collection_name}"
             )
-            collection_results[collection_name] = VECTOR_DB_CLIENT.get(
-                collection_name=collection_name
-            )
+            if filter:
+                collection_results[collection_name] = VECTOR_DB_CLIENT.query(
+                    collection_name=collection_name,
+                    filter=filter,
+                )
+            else:
+                collection_results[collection_name] = VECTOR_DB_CLIENT.get(
+                    collection_name=collection_name
+                )
         except Exception as e:
             log.exception(f"Failed to fetch collection {collection_name}: {e}")
             collection_results[collection_name] = None
@@ -514,6 +551,8 @@ async def query_collection_with_hybrid_search(
                 r=r,
                 hybrid_bm25_weight=hybrid_bm25_weight,
                 enable_enriched_texts=enable_enriched_texts,
+                filter=filter,
+                rerank=rerank,
             )
             return result, None
         except Exception as e:
@@ -545,12 +584,11 @@ async def query_collection_with_hybrid_search(
             "Hybrid search failed for all collections. Using Non-hybrid search as fallback."
         )
 
-    # If global_top_k is True, merge and sort all results, then take top k
-    # If global_top_k is False, return all results (each source already returned k)
     if global_top_k:
         return merge_and_sort_query_results(results, k=k)
     else:
-        return merge_and_sort_query_results(results, k=None)  # No limit, return all
+        # Each collection already returned k results, just merge without re-limiting
+        return merge_and_sort_query_results(results, k=k * len(collection_names))
 
 
 def generate_openai_batch_embeddings(
@@ -586,7 +624,9 @@ def generate_openai_batch_embeddings(
         if "data" in data:
             return [elem["embedding"] for elem in data["data"]]
         else:
-            raise "Something went wrong :/"
+            raise ValueError(
+                "Unexpected OpenAI embeddings response: missing 'data' key"
+            )
     except Exception as e:
         log.exception(f"Error generating openai batch embeddings: {e}")
         return None
@@ -619,7 +659,10 @@ async def agenerate_openai_batch_embeddings(
             trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
         ) as session:
             async with session.post(
-                f"{url}/embeddings", headers=headers, json=form_data
+                f"{url}/embeddings",
+                headers=headers,
+                json=form_data,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
             ) as r:
                 r.raise_for_status()
                 data = await r.json()
@@ -709,7 +752,12 @@ async def agenerate_azure_openai_batch_embeddings(
         async with aiohttp.ClientSession(
             trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
         ) as session:
-            async with session.post(full_url, headers=headers, json=form_data) as r:
+            async with session.post(
+                full_url,
+                headers=headers,
+                json=form_data,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as r:
                 r.raise_for_status()
                 data = await r.json()
                 if "data" in data:
@@ -755,7 +803,9 @@ def generate_ollama_batch_embeddings(
         if "embeddings" in data:
             return data["embeddings"]
         else:
-            raise "Something went wrong :/"
+            raise ValueError(
+                "Unexpected Ollama embeddings response: missing 'embeddings' key"
+            )
     except Exception as e:
         log.exception(f"Error generating ollama batch embeddings: {e}")
         return None
@@ -813,6 +863,7 @@ def get_embedding_function(
     embedding_batch_size,
     azure_api_version=None,
     enable_async=True,
+    concurrent_requests=0,
 ) -> Awaitable:
     if embedding_engine == "":
         # Sentence transformers: CPU-bound sync operation
@@ -854,11 +905,25 @@ def get_embedding_function(
                     log.debug(
                         f"generate_multiple_async: Processing {len(batches)} batches in parallel"
                     )
-                    # Execute all batches in parallel
-                    tasks = [
-                        embedding_function(batch, prefix=prefix, user=user)
-                        for batch in batches
-                    ]
+                    # Use semaphore to limit concurrent embedding API requests
+                    # 0 = unlimited (no semaphore)
+                    if concurrent_requests:
+                        semaphore = asyncio.Semaphore(concurrent_requests)
+
+                        async def generate_batch_with_semaphore(batch):
+                            async with semaphore:
+                                return await embedding_function(
+                                    batch, prefix=prefix, user=user
+                                )
+
+                        tasks = [
+                            generate_batch_with_semaphore(batch) for batch in batches
+                        ]
+                    else:
+                        tasks = [
+                            embedding_function(batch, prefix=prefix, user=user)
+                            for batch in batches
+                        ]
                     batch_results = await asyncio.gather(*tasks)
                 else:
                     log.debug(
@@ -949,6 +1014,107 @@ def get_reranking_function(reranking_engine, reranking_model, reranking_function
         )
 
 
+async def finalize_query_results(
+    query_results: list[dict],
+    queries: list[str],
+    embedding_function,
+    reranking_function,
+    top_k: Optional[int] = None,
+    top_k_reranker: Optional[int] = None,
+    relevance_threshold: Optional[float] = None,
+):
+    merged = merge_and_sort_query_results(query_results, k=None)
+
+    if top_k:
+        merged = merge_and_sort_query_results([merged], k=top_k)
+
+    if not top_k_reranker or len(merged.get("documents", [])) == 0:
+        return merged
+
+    documents = merged.get("documents", [[]])[0]
+    metadatas = merged.get("metadatas", [[]])[0]
+    distances = merged.get("distances", [[]])[0]
+
+    if not documents:
+        return merged
+
+    docs = [
+        Document(page_content=document, metadata={**(metadata or {})})
+        for document, metadata in zip(documents, metadatas)
+    ]
+
+    compressor = RerankCompressor(
+        embedding_function=embedding_function,
+        top_n=top_k_reranker,
+        reranking_function=reranking_function,
+        r_score=relevance_threshold,
+    )
+
+    query_text = "\n".join([query for query in queries if query]) or ""
+    reranked_docs = await compressor.acompress_documents(docs, query_text)
+
+    if not reranked_docs:
+        return {"distances": [[]], "documents": [[]], "metadatas": [[]]}
+
+    reranked_documents = [doc.page_content for doc in reranked_docs]
+    reranked_metadatas = [doc.metadata for doc in reranked_docs]
+    reranked_distances = [
+        doc.metadata.get("score", distances[index] if index < len(distances) else 0.0)
+        for index, doc in enumerate(reranked_docs)
+    ]
+
+    return {
+        "distances": [reranked_distances],
+        "documents": [reranked_documents],
+        "metadatas": [reranked_metadatas],
+    }
+
+
+def regroup_query_results_by_item(
+    query_results: list[dict], finalized_result: dict
+) -> list[dict]:
+    result_by_doc_hash = {}
+    for query_result in query_results:
+        documents = query_result.get("documents", [[]])[0]
+        for document in documents:
+            if isinstance(document, str):
+                result_by_doc_hash[hashlib.sha256(document.encode()).hexdigest()] = query_result
+
+    regrouped_results = []
+    grouped_by_item = {}
+    final_documents = finalized_result.get("documents", [[]])[0]
+    final_metadatas = finalized_result.get("metadatas", [[]])[0]
+    final_distances = finalized_result.get("distances", [[]])[0]
+
+    for document, metadata, distance in zip(final_documents, final_metadatas, final_distances):
+        query_result = None
+        if isinstance(document, str):
+            query_result = result_by_doc_hash.get(hashlib.sha256(document.encode()).hexdigest())
+        if query_result is None:
+            query_result = query_results[0] if query_results else None
+        if query_result is None:
+            continue
+
+        item_key = query_result.get("item_index")
+        grouped = grouped_by_item.get(item_key)
+        if grouped is None:
+            grouped = {
+                "distances": [[]],
+                "documents": [[]],
+                "metadatas": [[]],
+                "file": query_result.get("file"),
+                "item_index": item_key,
+            }
+            grouped_by_item[item_key] = grouped
+            regrouped_results.append(grouped)
+
+        grouped["distances"][0].append(distance)
+        grouped["documents"][0].append(document)
+        grouped["metadatas"][0].append(metadata)
+
+    return regrouped_results
+
+
 async def get_sources_from_items(
     request,
     items,
@@ -960,20 +1126,24 @@ async def get_sources_from_items(
     r,
     hybrid_bm25_weight,
     hybrid_search,
+    global_top_k=True,
     full_context=False,
-    global_top_k: bool = True,
     user: Optional[UserModel] = None,
 ):
     log.debug(
         f"items: {items} {queries} {embedding_function} {reranking_function} {full_context}"
     )
 
+    k_reranker = min(k_reranker, k) if k_reranker else k_reranker
+
     extracted_collections = []
     query_results = []
 
-    for item in items:
+    for item_index, item in enumerate(items):
         query_result = None
         collection_names = []
+        file_filter = None
+        skip_collection_retrieval = False
 
         if item.get("type") == "text":
             # Raw Text
@@ -1018,7 +1188,12 @@ async def get_sources_from_items(
             if note and (
                 user.role == "admin"
                 or note.user_id == user.id
-                or has_access(user.id, "read", note.access_control)
+                or AccessGrants.has_access(
+                    user_id=user.id,
+                    resource_type="note",
+                    resource_id=note.id,
+                    permission="read",
+                )
             ):
                 # User has access to the note
                 query_result = {
@@ -1110,7 +1285,12 @@ async def get_sources_from_items(
             if knowledge_base and (
                 user.role == "admin"
                 or knowledge_base.user_id == user.id
-                or has_access(user.id, "read", knowledge_base.access_control)
+                or AccessGrants.has_access(
+                    user_id=user.id,
+                    resource_type="knowledge",
+                    resource_id=knowledge_base.id,
+                    permission="read",
+                )
             ):
                 if (
                     item.get("context") == "full"
@@ -1119,7 +1299,12 @@ async def get_sources_from_items(
                     if knowledge_base and (
                         user.role == "admin"
                         or knowledge_base.user_id == user.id
-                        or has_access(user.id, "read", knowledge_base.access_control)
+                        or AccessGrants.has_access(
+                            user_id=user.id,
+                            resource_type="knowledge",
+                            resource_id=knowledge_base.id,
+                            permission="read",
+                        )
                     ):
                         files = Knowledges.get_files_by_id(knowledge_base.id)
 
@@ -1146,6 +1331,21 @@ async def get_sources_from_items(
                     else:
                         collection_names.append(item["id"])
 
+                    # AIH-Infra: Extract enabled file IDs for filtering
+                    files_list = item.get("files")
+                    if files_list is not None:
+                        enabled_file_ids = [
+                            f["id"] for f in files_list if f.get("enabled", True)
+                        ]
+                        if enabled_file_ids:
+                            file_filter = {"file_id": {"$in": enabled_file_ids}}
+                            log.debug(f"Collection {item['id']} file filter: {file_filter}")
+                        else:
+                            skip_collection_retrieval = True
+                            log.debug(
+                                f"Collection {item['id']} has no enabled files; skipping retrieval"
+                            )
+
         elif item.get("docs"):
             # BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL
             query_result = {
@@ -1167,6 +1367,10 @@ async def get_sources_from_items(
                 log.debug(f"skipping {item} as it has already been extracted")
                 continue
 
+            if skip_collection_retrieval:
+                extracted_collections.extend(collection_names)
+                continue
+
             try:
                 if full_context:
                     query_result = get_all_items_from_collections(collection_names)
@@ -1184,7 +1388,8 @@ async def get_sources_from_items(
                                 r=r,
                                 hybrid_bm25_weight=hybrid_bm25_weight,
                                 enable_enriched_texts=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS,
-                                global_top_k=global_top_k,
+                                filter=file_filter,  # AIH-Infra: Add file filter
+                                rerank=False,
                             )
                         except Exception as e:
                             log.debug(
@@ -1192,13 +1397,13 @@ async def get_sources_from_items(
                             )
 
                     # fallback to non-hybrid search
-                    if not hybrid_search and query_result is None:
+                    if query_result is None:
                         query_result = await query_collection(
                             collection_names=collection_names,
                             queries=queries,
                             embedding_function=embedding_function,
                             k=k,
-                            global_top_k=global_top_k,
+                            filter=file_filter,  # AIH-Infra: Add file filter
                         )
             except Exception as e:
                 log.exception(e)
@@ -1206,9 +1411,58 @@ async def get_sources_from_items(
             extracted_collections.extend(collection_names)
 
         if query_result:
+            if not full_context:
+                if hybrid_search:
+                    query_result = await finalize_query_results(
+                        [query_result],
+                        queries=queries,
+                        embedding_function=embedding_function,
+                        reranking_function=reranking_function,
+                        top_k=k,
+                        top_k_reranker=(None if global_top_k else k_reranker),
+                        relevance_threshold=r,
+                    )
+                elif not global_top_k:
+                    query_result = await finalize_query_results(
+                        [query_result],
+                        queries=queries,
+                        embedding_function=embedding_function,
+                        reranking_function=reranking_function,
+                        top_k=k,
+                        top_k_reranker=None,
+                        relevance_threshold=None,
+                    )
+
             if "data" in item:
                 del item["data"]
-            query_results.append({**query_result, "file": item})
+            query_results.append({**query_result, "file": item, "item_index": item_index})
+
+    if global_top_k and not full_context:
+        global_results = [
+            {
+                "distances": query_result.get("distances", [[]]),
+                "documents": query_result.get("documents", [[]]),
+                "metadatas": query_result.get("metadatas", [[]]),
+            }
+            for query_result in query_results
+            if query_result.get("distances")
+            and query_result.get("documents")
+            and query_result.get("metadatas")
+        ]
+
+        if global_results:
+            finalized_global_result = await finalize_query_results(
+                global_results,
+                queries=queries,
+                embedding_function=embedding_function,
+                reranking_function=reranking_function,
+                top_k=k,
+                top_k_reranker=(k_reranker if hybrid_search else None),
+                relevance_threshold=(r if hybrid_search else None),
+            )
+            query_results = regroup_query_results_by_item(
+                query_results, finalized_global_result
+            )
 
     sources = []
     for query_result in query_results:
@@ -1221,60 +1475,16 @@ async def get_sources_from_items(
                         "metadata": query_result["metadatas"][0],
                     }
                     if "distances" in query_result and query_result["distances"]:
-                        source["distances"] = query_result["distances"][0]
+                        distances = query_result["distances"][0]
+                        # AIH-Infra: Apply boost - smaller distance = higher similarity
+                        boost = query_result["file"].get("boost", 1.0)
+                        if boost != 1.0:
+                            distances = [d / boost for d in distances]
+                        source["distances"] = distances
 
                     sources.append(source)
         except Exception as e:
             log.exception(e)
-
-    # Apply global top_k filtering across all sources
-    if global_top_k and not full_context:
-        # Flatten all documents with their scores for global sorting
-        all_docs = []
-        for source in sources:
-            documents = source.get("document", [])
-            metadatas = source.get("metadata", [])
-            distances = source.get("distances", [])
-            source_info = source.get("source", {})
-
-            for idx, doc in enumerate(documents):
-                score = distances[idx] if idx < len(distances) else 0
-                metadata = metadatas[idx] if idx < len(metadatas) else {}
-                all_docs.append({
-                    "document": doc,
-                    "metadata": metadata,
-                    "score": score,
-                    "source": source_info,
-                })
-
-        # Filter by relevance threshold (r) if set
-        if r > 0:
-            all_docs = [d for d in all_docs if d["score"] >= r]
-            log.info(f"After relevance threshold filtering (r={r}): {len(all_docs)} documents")
-
-        # Sort by score (descending) and take top k
-        all_docs.sort(key=lambda x: x["score"], reverse=True)
-        all_docs = all_docs[:k]
-
-        log.info(f"Global top_k applied: {len(all_docs)} documents (k={k})")
-
-        # Rebuild sources structure grouped by source
-        sources_by_file = {}
-        for doc in all_docs:
-            source_key = str(doc["source"].get("id", doc["source"].get("name", "unknown")))
-            if source_key not in sources_by_file:
-                sources_by_file[source_key] = {
-                    "source": doc["source"],
-                    "document": [],
-                    "metadata": [],
-                    "distances": [],
-                }
-            sources_by_file[source_key]["document"].append(doc["document"])
-            sources_by_file[source_key]["metadata"].append(doc["metadata"])
-            sources_by_file[source_key]["distances"].append(doc["score"])
-
-        sources = list(sources_by_file.values())
-
     return sources
 
 
@@ -1316,6 +1526,8 @@ def get_model_path(model: str, update_model: bool = False):
         return model_repo_path
     except Exception as e:
         log.exception(f"Cannot determine model snapshot path: {e}")
+        if OFFLINE_MODE:
+            raise
         return model
 
 
