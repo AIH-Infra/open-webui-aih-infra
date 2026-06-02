@@ -59,6 +59,20 @@ htmlcov/
 .coverage
 .coverage.*
 .cache
+
+# Local workspace artifacts that should not be published
+.claude/
+.claude_compare_file_index.json
+.claude_compare_hunks.json
+.git.broken.worktree.backup
+plans/
+open-webui-aih-infra-1.0-main/
+release-artifacts/
+webui.debug.db
+webui.debug.latest.db
+*.db
+*.sqlite
+*.sqlite3
 nosetests.xml
 coverage.xml
 *.cover
