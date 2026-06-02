@@ -8,7 +8,12 @@ from sqlalchemy.orm import Session
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 from open_webui.models.tags import TagModel, Tag, Tags
 from open_webui.models.folders import Folders
-from open_webui.utils.misc import sanitize_data_for_db, sanitize_text_for_db
+from open_webui.models.chat_messages import ChatMessage, ChatMessages
+from open_webui.utils.misc import (
+    normalize_output_for_replay,
+    sanitize_data_for_db,
+    sanitize_text_for_db,
+)
 
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import (
@@ -31,6 +36,340 @@ from sqlalchemy.sql.expression import bindparam
 ####################
 
 log = logging.getLogger(__name__)
+
+
+def normalize_collection_file_for_persistence(file_item: dict) -> dict:
+    normalized_file = {"id": file_item.get("id"), "enabled": file_item.get("enabled", True)}
+    if file_item.get("filename"):
+        normalized_file["filename"] = file_item.get("filename")
+    elif file_item.get("name"):
+        normalized_file["name"] = file_item.get("name")
+    return {k: v for k, v in normalized_file.items() if v is not None}
+
+
+def normalize_chat_file_for_persistence(file_item: dict) -> dict:
+    if not isinstance(file_item, dict):
+        return file_item
+
+    if file_item.get("type") != "collection":
+        return file_item
+
+    normalized = {
+        "id": file_item.get("id"),
+        "type": "collection",
+        "name": file_item.get("name"),
+        "boost": file_item.get("boost", 1.0),
+        "allFilesEnabled": file_item.get("allFilesEnabled", True),
+        "files": [
+            normalize_collection_file_for_persistence(child)
+            for child in file_item.get("files", [])
+            if isinstance(child, dict)
+        ],
+    }
+    return {k: v for k, v in normalized.items() if v is not None}
+
+
+def normalize_status_history_for_persistence(status_history: list) -> list:
+    if not isinstance(status_history, list):
+        return status_history
+
+    heavy_keys = {
+        "sources",
+        "source",
+        "document",
+        "documents",
+        "chunks",
+        "chunk",
+        "content",
+        "contents",
+        "payload",
+        "result",
+        "results",
+    }
+    normalized_history = []
+    for status in status_history:
+        if not isinstance(status, dict):
+            normalized_history.append(status)
+            continue
+        normalized_history.append(
+            {key: value for key, value in status.items() if key not in heavy_keys}
+        )
+    return normalized_history
+
+
+def normalize_source_metadata_for_persistence(metadata: dict) -> dict:
+    if not isinstance(metadata, dict):
+        return metadata
+
+    allowed_keys = {
+        "source",
+        "name",
+        "url",
+        "file_id",
+        "note_id",
+        "page",
+        "page_start",
+        "page_end",
+        "print_page_start",
+        "print_page_end",
+        "knowledge_id",
+        "knowledge_name",
+        "title",
+        "token_count",
+        "parameters",
+    }
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key in allowed_keys and value is not None
+    }
+
+
+def normalize_source_info_for_persistence(source_info: dict) -> dict:
+    if not isinstance(source_info, dict):
+        return source_info
+
+    allowed_keys = {"id", "name", "type", "url", "embed_url"}
+    return {
+        key: value
+        for key, value in source_info.items()
+        if key in allowed_keys and value is not None
+    }
+
+
+def normalize_sources_for_persistence(sources: list) -> list:
+    if not isinstance(sources, list):
+        return sources
+
+    normalized_sources = []
+    for source in sources:
+        if not isinstance(source, dict):
+            normalized_sources.append(source)
+            continue
+
+        normalized_source = {
+            "source": normalize_source_info_for_persistence(source.get("source", {})),
+            "document": source.get("document", []),
+            "metadata": [
+                normalize_source_metadata_for_persistence(metadata)
+                for metadata in source.get("metadata", [])
+            ],
+        }
+
+        if isinstance(source.get("distances"), list):
+            normalized_source["distances"] = source.get("distances", [])
+
+        normalized_sources.append(normalized_source)
+
+    return normalized_sources
+
+
+def normalize_output_for_persistence(output):
+    if not isinstance(output, list):
+        return output
+    return normalize_output_for_replay(output)
+
+
+def prefer_non_none(value, fallback):
+    return fallback if value is None else value
+
+
+def prefer_list(value, fallback):
+    if isinstance(value, list):
+        return value
+    if isinstance(fallback, list):
+        return fallback
+    return []
+
+
+def project_message_to_detail_snapshot(message: dict) -> dict:
+    if not isinstance(message, dict):
+        return message
+
+    normalized = dict(message)
+
+    if isinstance(normalized.get("files"), list):
+        normalized["files"] = [
+            normalize_chat_file_for_persistence(file_item)
+            for file_item in normalized["files"]
+        ]
+
+    if "output" in normalized:
+        normalized["output"] = normalize_output_for_persistence(normalized.get("output"))
+
+    if "statusHistory" in normalized:
+        normalized["statusHistory"] = normalize_status_history_for_persistence(
+            normalized.get("statusHistory")
+        )
+
+    if "sources" in normalized:
+        normalized["sources"] = normalize_sources_for_persistence(
+            normalized.get("sources")
+        )
+
+    return normalized
+
+
+def project_message_to_history_skeleton(
+    message: dict, compatibility_mode: bool = True
+) -> dict:
+    if not isinstance(message, dict):
+        return message
+
+    projected = project_message_to_detail_snapshot(message)
+    if compatibility_mode:
+        return projected
+
+    allowed_keys = {
+        "id",
+        "parentId",
+        "childrenIds",
+        "role",
+        "content",
+        "model",
+        "modelName",
+        "timestamp",
+        "done",
+        "error",
+        "models",
+        "selectedModelId",
+        "arena",
+        "modelIdx",
+        "annotation",
+        "favorite",
+        "followUps",
+        "feedbackId",
+        "originalContent",
+        "merged",
+        "code_executions",
+        "ragSnapshot",
+    }
+    skeleton = {
+        key: value for key, value in projected.items() if key in allowed_keys
+    }
+    if projected.get("role") != "assistant" and "files" in projected:
+        skeleton["files"] = projected.get("files")
+    return skeleton
+
+
+def normalize_message_for_persistence(message: dict) -> dict:
+    return project_message_to_history_skeleton(message, compatibility_mode=False)
+
+
+def normalize_chat_for_persistence(chat: dict) -> dict:
+    if not isinstance(chat, dict):
+        return chat
+
+    normalized_chat = dict(chat)
+
+    if isinstance(normalized_chat.get("files"), list):
+        normalized_chat["files"] = [
+            normalize_chat_file_for_persistence(file_item)
+            for file_item in normalized_chat.get("files", [])
+        ]
+
+    history = normalized_chat.get("history")
+    if isinstance(history, dict) and isinstance(history.get("messages"), dict):
+        normalized_messages = {}
+        for message_id, message in history["messages"].items():
+            normalized_messages[message_id] = project_message_to_history_skeleton(
+                message, compatibility_mode=False
+            )
+        normalized_chat["history"] = {**history, "messages": normalized_messages}
+
+    return normalized_chat
+
+
+def sync_chat_history_to_chat_messages(
+    chat_id: str, user_id: str, chat: dict, db: Optional[Session] = None
+) -> None:
+    history = chat.get("history", {}) if isinstance(chat, dict) else {}
+    messages = history.get("messages", {}) if isinstance(history, dict) else {}
+
+    for message_id, message in messages.items():
+        if isinstance(message, dict) and message.get("role"):
+            existing_chat_message = ChatMessages.get_message_by_id(
+                f"{chat_id}-{message_id}", db=db
+            )
+            merged_detail_message = {
+                **build_message_detail_snapshot(
+                    chat_id,
+                    message_id,
+                    message,
+                    existing_chat_message,
+                ),
+                **project_message_to_detail_snapshot(message),
+                "id": message_id,
+                "chat_id": chat_id,
+            }
+            ChatMessages.upsert_message(
+                message_id=message_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                data=merged_detail_message,
+                db=db,
+            )
+
+
+def build_message_detail_snapshot(
+    chat_id: str, message_id: str, history_message: dict, chat_message=None
+) -> dict:
+    detail_snapshot = project_message_to_detail_snapshot(history_message or {})
+    detail_snapshot["id"] = message_id
+    detail_snapshot["chat_id"] = chat_id
+
+    if chat_message is None:
+        return detail_snapshot
+
+    detail = chat_message.model_dump()
+    detail_snapshot.update(
+        {
+            "role": prefer_non_none(detail.get("role"), detail_snapshot.get("role")),
+            "parentId": prefer_non_none(
+                detail.get("parent_id"), detail_snapshot.get("parentId")
+            ),
+            "content": prefer_non_none(
+                detail.get("content"), detail_snapshot.get("content")
+            ),
+            "output": prefer_non_none(
+                detail.get("output"), detail_snapshot.get("output")
+            ),
+            "model": prefer_non_none(
+                detail.get("model_id"), detail_snapshot.get("model")
+            ),
+            "files": prefer_non_none(
+                detail.get("files"), detail_snapshot.get("files")
+            ),
+            "sources": prefer_non_none(
+                detail.get("sources"), detail_snapshot.get("sources")
+            ),
+            "embeds": prefer_non_none(
+                detail.get("embeds"), detail_snapshot.get("embeds")
+            ),
+            "statusHistory": prefer_non_none(
+                normalize_status_history_for_persistence(
+                    prefer_list(
+                        detail.get("status_history"),
+                        detail_snapshot.get("statusHistory"),
+                    )
+                ),
+                detail_snapshot.get("statusHistory"),
+            ),
+            "error": prefer_non_none(
+                detail.get("error"), detail_snapshot.get("error")
+            ),
+            "usage": prefer_non_none(
+                detail.get("usage"), detail_snapshot.get("usage")
+            ),
+            "timestamp": prefer_non_none(
+                detail.get("created_at"), detail_snapshot.get("timestamp")
+            ),
+            "done": prefer_non_none(
+                detail.get("done"), detail_snapshot.get("done", True)
+            ),
+        }
+    )
+    return detail_snapshot
 
 
 class Chat(Base):
@@ -168,6 +507,14 @@ class ChatTitleIdResponse(BaseModel):
     created_at: int
 
 
+class SharedChatResponse(BaseModel):
+    id: str
+    title: str
+    share_id: Optional[str] = None
+    updated_at: int
+    created_at: int
+
+
 class ChatListResponse(BaseModel):
     items: list[ChatModel]
     total: int
@@ -285,17 +632,18 @@ class ChatTable:
         self, user_id: str, form_data: ChatForm, db: Optional[Session] = None
     ) -> Optional[ChatModel]:
         with get_db_context(db) as db:
+            normalized_chat = normalize_chat_for_persistence(form_data.chat)
             id = str(uuid.uuid4())
             chat = ChatModel(
                 **{
                     "id": id,
                     "user_id": user_id,
                     "title": self._clean_null_bytes(
-                        form_data.chat["title"]
-                        if "title" in form_data.chat
+                        normalized_chat["title"]
+                        if "title" in normalized_chat
                         else "New Chat"
                     ),
-                    "chat": self._clean_null_bytes(form_data.chat),
+                    "chat": self._clean_null_bytes(normalized_chat),
                     "folder_id": form_data.folder_id,
                     "created_at": int(time.time()),
                     "updated_at": int(time.time()),
@@ -306,20 +654,39 @@ class ChatTable:
             db.add(chat_item)
             db.commit()
             db.refresh(chat_item)
+
+            # Dual-write initial messages to chat_message table
+            try:
+                history = form_data.chat.get("history", {})
+                messages = history.get("messages", {})
+                for message_id, message in messages.items():
+                    if isinstance(message, dict) and message.get("role"):
+                        ChatMessages.upsert_message(
+                            message_id=message_id,
+                            chat_id=id,
+                            user_id=user_id,
+                            data=project_message_to_detail_snapshot(message),
+                        )
+            except Exception as e:
+                log.warning(
+                    f"Failed to write initial messages to chat_message table: {e}"
+                )
+
             return ChatModel.model_validate(chat_item) if chat_item else None
 
     def _chat_import_form_to_chat_model(
         self, user_id: str, form_data: ChatImportForm
     ) -> ChatModel:
         id = str(uuid.uuid4())
+        normalized_chat = normalize_chat_for_persistence(form_data.chat)
         chat = ChatModel(
             **{
                 "id": id,
                 "user_id": user_id,
                 "title": self._clean_null_bytes(
-                    form_data.chat["title"] if "title" in form_data.chat else "New Chat"
+                    normalized_chat["title"] if "title" in normalized_chat else "New Chat"
                 ),
-                "chat": self._clean_null_bytes(form_data.chat),
+                "chat": self._clean_null_bytes(normalized_chat),
                 "meta": form_data.meta,
                 "pinned": form_data.pinned,
                 "folder_id": form_data.folder_id,
@@ -348,6 +715,25 @@ class ChatTable:
 
             db.add_all(chats)
             db.commit()
+
+            # Dual-write messages to chat_message table
+            try:
+                for form_data, chat_obj in zip(chat_import_forms, chats):
+                    history = form_data.chat.get("history", {})
+                    messages = history.get("messages", {})
+                    for message_id, message in messages.items():
+                        if isinstance(message, dict) and message.get("role"):
+                            ChatMessages.upsert_message(
+                                message_id=message_id,
+                                chat_id=chat_obj.id,
+                                user_id=user_id,
+                                data=project_message_to_detail_snapshot(message),
+                            )
+            except Exception as e:
+                log.warning(
+                    f"Failed to write imported messages to chat_message table: {e}"
+                )
+
             return [ChatModel.model_validate(chat) for chat in chats]
 
     def update_chat_by_id(
@@ -356,10 +742,11 @@ class ChatTable:
         try:
             with get_db_context(db) as db:
                 chat_item = db.get(Chat, id)
-                chat_item.chat = self._clean_null_bytes(chat)
+                normalized_chat = normalize_chat_for_persistence(chat)
+                chat_item.chat = self._clean_null_bytes(normalized_chat)
                 chat_item.title = (
-                    self._clean_null_bytes(chat["title"])
-                    if "title" in chat
+                    self._clean_null_bytes(normalized_chat["title"])
+                    if "title" in normalized_chat
                     else "New Chat"
                 )
 
@@ -367,6 +754,18 @@ class ChatTable:
 
                 db.commit()
                 db.refresh(chat_item)
+
+                try:
+                    sync_chat_history_to_chat_messages(
+                        chat_id=id,
+                        user_id=chat_item.user_id,
+                        chat=chat,
+                        db=db,
+                    )
+                except Exception as e:
+                    log.warning(
+                        f"Failed to resync chat history to chat_message table: {e}"
+                    )
 
                 return ChatModel.model_validate(chat_item)
         except Exception:
@@ -385,29 +784,36 @@ class ChatTable:
     def update_chat_tags_by_id(
         self, id: str, tags: list[str], user
     ) -> Optional[ChatModel]:
-        chat = self.get_chat_by_id(id)
-        if chat is None:
-            return None
+        with get_db_context() as db:
+            chat = db.get(Chat, id)
+            if chat is None:
+                return None
 
-        self.delete_all_tags_by_id_and_user_id(id, user.id)
+            old_tags = chat.meta.get("tags", [])
+            new_tags = [t for t in tags if t.replace(" ", "_").lower() != "none"]
+            new_tag_ids = [t.replace(" ", "_").lower() for t in new_tags]
 
-        for tag in chat.meta.get("tags", []):
-            if self.count_chats_by_tag_name_and_user_id(tag, user.id) == 0:
-                Tags.delete_tag_by_name_and_user_id(tag, user.id)
+            # Single meta update
+            chat.meta = {**chat.meta, "tags": new_tag_ids}
+            db.commit()
+            db.refresh(chat)
 
-        for tag_name in tags:
-            if tag_name.lower() == "none":
-                continue
+            # Batch-create any missing tag rows
+            Tags.ensure_tags_exist(new_tags, user.id, db=db)
 
-            self.add_chat_tag_by_id_and_user_id_and_tag_name(id, user.id, tag_name)
-        return self.get_chat_by_id(id)
+            # Clean up orphaned old tags in one query
+            removed = set(old_tags) - set(new_tag_ids)
+            if removed:
+                self.delete_orphan_tags_for_user(list(removed), user.id, db=db)
+
+            return ChatModel.model_validate(chat)
 
     def get_chat_title_by_id(self, id: str) -> Optional[str]:
-        chat = self.get_chat_by_id(id)
-        if chat is None:
-            return None
-
-        return chat.chat.get("title", "New Chat")
+        with get_db_context() as db:
+            result = db.query(Chat.title).filter_by(id=id).first()
+            if result is None:
+                return None
+            return result[0] or "New Chat"
 
     def get_messages_map_by_chat_id(self, id: str) -> Optional[dict]:
         chat = self.get_chat_by_id(id)
@@ -425,10 +831,31 @@ class ChatTable:
 
         return chat.chat.get("history", {}).get("messages", {}).get(message_id, {})
 
+    def get_message_detail_by_id_and_message_id(
+        self, id: str, message_id: str, db: Optional[Session] = None
+    ) -> Optional[dict]:
+        chat = self.get_chat_by_id(id, db=db)
+        if chat is None:
+            return None
+
+        history_message = (
+            chat.chat.get("history", {}).get("messages", {}).get(message_id, {}) or {}
+        )
+        chat_message = ChatMessages.get_message_by_id(f"{id}-{message_id}", db=db)
+
+        if chat_message is None:
+            return build_message_detail_snapshot(id, message_id, history_message)
+
+        return build_message_detail_snapshot(id, message_id, history_message, chat_message)
+
     def upsert_message_to_chat_by_id_and_message_id(
-        self, id: str, message_id: str, message: dict
+        self,
+        id: str,
+        message_id: str,
+        message: dict,
+        db: Optional[Session] = None,
     ) -> Optional[ChatModel]:
-        chat = self.get_chat_by_id(id)
+        chat = self.get_chat_by_id(id, db=db)
         if chat is None:
             return None
 
@@ -436,21 +863,43 @@ class ChatTable:
         if isinstance(message.get("content"), str):
             message["content"] = sanitize_text_for_db(message["content"])
 
+        user_id = chat.user_id
         chat = chat.chat
         history = chat.get("history", {})
+        history_messages = history.setdefault("messages", {})
+        detail_message = project_message_to_detail_snapshot(message)
+        existing_detail_message = self.get_message_detail_by_id_and_message_id(
+            id, message_id, db=db
+        ) or build_message_detail_snapshot(
+            id, message_id, history_messages.get(message_id, {})
+        )
+        merged_detail_message = {
+            **existing_detail_message,
+            **detail_message,
+            "id": message_id,
+            "chat_id": id,
+        }
 
-        if message_id in history.get("messages", {}):
-            history["messages"][message_id] = {
-                **history["messages"][message_id],
-                **message,
-            }
-        else:
-            history["messages"][message_id] = message
+        history_messages[message_id] = project_message_to_history_skeleton(
+            merged_detail_message, compatibility_mode=False
+        )
 
         history["currentId"] = message_id
 
         chat["history"] = history
-        return self.update_chat_by_id(id, chat)
+
+        # Dual-write to chat_message table
+        try:
+            ChatMessages.upsert_message(
+                message_id=message_id,
+                chat_id=id,
+                user_id=user_id,
+                data=merged_detail_message,
+            )
+        except Exception as e:
+            log.warning(f"Failed to write to chat_message table: {e}")
+
+        return self.update_chat_by_id(id, chat, db=db)
 
     def add_message_status_to_chat_by_id_and_message_id(
         self, id: str, message_id: str, status: dict
@@ -459,16 +908,41 @@ class ChatTable:
         if chat is None:
             return None
 
-        chat = chat.chat
-        history = chat.get("history", {})
+        user_id = chat.user_id
+        chat_data = chat.chat
+        history = chat_data.get("history", {})
+        history_messages = history.get("messages", {})
 
-        if message_id in history.get("messages", {}):
-            status_history = history["messages"][message_id].get("statusHistory", [])
+        if message_id in history_messages:
+            detail_message = self.get_message_detail_by_id_and_message_id(
+                id, message_id
+            ) or build_message_detail_snapshot(
+                id, message_id, history_messages.get(message_id, {})
+            )
+            status_history = detail_message.get("statusHistory")
+            if not isinstance(status_history, list):
+                status_history = []
             status_history.append(status)
-            history["messages"][message_id]["statusHistory"] = status_history
+            detail_message["statusHistory"] = normalize_status_history_for_persistence(
+                status_history
+            )
+            history_messages[message_id] = project_message_to_history_skeleton(
+                detail_message, compatibility_mode=False
+            )
 
-        chat["history"] = history
-        return self.update_chat_by_id(id, chat)
+            try:
+                ChatMessages.upsert_message(
+                    message_id=message_id,
+                    chat_id=id,
+                    user_id=user_id,
+                    data=detail_message,
+                )
+            except Exception as e:
+                log.warning(f"Failed to write status update to chat_message table: {e}")
+
+        history["messages"] = history_messages
+        chat_data["history"] = history
+        return self.update_chat_by_id(id, chat_data)
 
     def add_message_files_by_id_and_message_id(
         self, id: str, message_id: str, files: list[dict]
@@ -478,18 +952,42 @@ class ChatTable:
             if chat is None:
                 return None
 
-            chat = chat.chat
-            history = chat.get("history", {})
+            user_id = chat.user_id
+            chat_data = chat.chat
+            history = chat_data.get("history", {})
+            history_messages = history.get("messages", {})
 
             message_files = []
 
-            if message_id in history.get("messages", {}):
-                message_files = history["messages"][message_id].get("files", [])
+            if message_id in history_messages:
+                detail_message = self.get_message_detail_by_id_and_message_id(
+                    id, message_id, db=db
+                ) or build_message_detail_snapshot(
+                    id, message_id, history_messages.get(message_id, {})
+                )
+                message_files = detail_message.get("files", [])
                 message_files = message_files + files
-                history["messages"][message_id]["files"] = message_files
+                detail_message["files"] = [
+                    normalize_chat_file_for_persistence(file_item)
+                    for file_item in message_files
+                ]
+                history_messages[message_id] = project_message_to_history_skeleton(
+                    detail_message, compatibility_mode=False
+                )
 
-            chat["history"] = history
-            self.update_chat_by_id(id, chat, db=db)
+                try:
+                    ChatMessages.upsert_message(
+                        message_id=message_id,
+                        chat_id=id,
+                        user_id=user_id,
+                        data=detail_message,
+                    )
+                except Exception as e:
+                    log.warning(f"Failed to write file update to chat_message table: {e}")
+
+            history["messages"] = history_messages
+            chat_data["history"] = history
+            self.update_chat_by_id(id, chat_data, db=db)
             return message_files
 
     def insert_shared_chat_by_chat_id(
@@ -563,6 +1061,15 @@ class ChatTable:
     ) -> bool:
         try:
             with get_db_context(db) as db:
+                # Use subquery to delete chat_messages for shared chats
+                shared_chat_id_subquery = (
+                    db.query(Chat.id)
+                    .filter_by(user_id=f"shared-{chat_id}")
+                    .scalar_subquery()
+                )
+                db.query(ChatMessage).filter(
+                    ChatMessage.chat_id.in_(shared_chat_id_subquery)
+                ).delete(synchronize_session=False)
                 db.query(Chat).filter_by(user_id=f"shared-{chat_id}").delete()
                 db.commit()
 
@@ -641,7 +1148,7 @@ class ChatTable:
         skip: int = 0,
         limit: int = 50,
         db: Optional[Session] = None,
-    ) -> list[ChatModel]:
+    ) -> list[ChatTitleIdResponse]:
 
         with get_db_context(db) as db:
             query = db.query(Chat).filter_by(user_id=user_id, archived=True)
@@ -659,13 +1166,17 @@ class ChatTable:
                         raise ValueError("Invalid order_by field")
 
                     if direction.lower() == "asc":
-                        query = query.order_by(getattr(Chat, order_by).asc())
+                        query = query.order_by(getattr(Chat, order_by).asc(), Chat.id)
                     elif direction.lower() == "desc":
-                        query = query.order_by(getattr(Chat, order_by).desc())
+                        query = query.order_by(getattr(Chat, order_by).desc(), Chat.id)
                     else:
                         raise ValueError("Invalid direction for ordering")
             else:
-                query = query.order_by(Chat.updated_at.desc())
+                query = query.order_by(Chat.updated_at.desc(), Chat.id)
+
+            query = query.with_entities(
+                Chat.id, Chat.title, Chat.updated_at, Chat.created_at
+            )
 
             if skip:
                 query = query.offset(skip)
@@ -673,7 +1184,83 @@ class ChatTable:
                 query = query.limit(limit)
 
             all_chats = query.all()
-            return [ChatModel.model_validate(chat) for chat in all_chats]
+            return [
+                ChatTitleIdResponse.model_validate(
+                    {
+                        "id": chat[0],
+                        "title": chat[1],
+                        "updated_at": chat[2],
+                        "created_at": chat[3],
+                    }
+                )
+                for chat in all_chats
+            ]
+
+    def get_shared_chat_list_by_user_id(
+        self,
+        user_id: str,
+        filter: Optional[dict] = None,
+        skip: int = 0,
+        limit: int = 50,
+        db: Optional[Session] = None,
+    ) -> list[SharedChatResponse]:
+
+        with get_db_context(db) as db:
+            query = (
+                db.query(Chat)
+                .filter_by(user_id=user_id)
+                .filter(Chat.share_id.isnot(None))
+            )
+
+            if filter:
+                query_key = filter.get("query")
+                if query_key:
+                    query = query.filter(Chat.title.ilike(f"%{query_key}%"))
+
+                order_by = filter.get("order_by")
+                direction = filter.get("direction")
+
+                if order_by and direction:
+                    if not getattr(Chat, order_by, None):
+                        raise ValueError("Invalid order_by field")
+
+                    if direction.lower() == "asc":
+                        query = query.order_by(getattr(Chat, order_by).asc(), Chat.id)
+                    elif direction.lower() == "desc":
+                        query = query.order_by(getattr(Chat, order_by).desc(), Chat.id)
+                    else:
+                        raise ValueError("Invalid direction for ordering")
+            else:
+                query = query.order_by(Chat.updated_at.desc(), Chat.id)
+
+            # Select only the columns needed for SharedChatResponse
+            # to avoid loading the heavy chat JSON blob
+            query = query.with_entities(
+                Chat.id,
+                Chat.title,
+                Chat.share_id,
+                Chat.updated_at,
+                Chat.created_at,
+            )
+
+            if skip:
+                query = query.offset(skip)
+            if limit:
+                query = query.limit(limit)
+
+            all_chats = query.all()
+            return [
+                SharedChatResponse.model_validate(
+                    {
+                        "id": chat[0],
+                        "title": chat[1],
+                        "share_id": chat[2],
+                        "updated_at": chat[3],
+                        "created_at": chat[4],
+                    }
+                )
+                for chat in all_chats
+            ]
 
     def get_chat_list_by_user_id(
         self,
@@ -699,13 +1286,13 @@ class ChatTable:
 
                 if order_by and direction and getattr(Chat, order_by):
                     if direction.lower() == "asc":
-                        query = query.order_by(getattr(Chat, order_by).asc())
+                        query = query.order_by(getattr(Chat, order_by).asc(), Chat.id)
                     elif direction.lower() == "desc":
-                        query = query.order_by(getattr(Chat, order_by).desc())
+                        query = query.order_by(getattr(Chat, order_by).desc(), Chat.id)
                     else:
                         raise ValueError("Invalid direction for ordering")
             else:
-                query = query.order_by(Chat.updated_at.desc())
+                query = query.order_by(Chat.updated_at.desc(), Chat.id)
 
             if skip:
                 query = query.offset(skip)
@@ -737,7 +1324,7 @@ class ChatTable:
             if not include_archived:
                 query = query.filter_by(archived=False)
 
-            query = query.order_by(Chat.updated_at.desc()).with_entities(
+            query = query.order_by(Chat.updated_at.desc(), Chat.id).with_entities(
                 Chat.id, Chat.title, Chat.updated_at, Chat.created_at
             )
 
@@ -821,6 +1408,37 @@ class ChatTable:
         except Exception:
             return None
 
+    def is_chat_owner(
+        self, id: str, user_id: str, db: Optional[Session] = None
+    ) -> bool:
+        """
+        Lightweight ownership check — uses EXISTS subquery instead of loading
+        the full Chat row (which includes the potentially large JSON blob).
+        """
+        try:
+            with get_db_context(db) as db:
+                return db.query(
+                    exists().where(and_(Chat.id == id, Chat.user_id == user_id))
+                ).scalar()
+        except Exception:
+            return False
+
+    def get_chat_folder_id(
+        self, id: str, user_id: str, db: Optional[Session] = None
+    ) -> Optional[str]:
+        """
+        Fetch only the folder_id column for a chat, without loading the full
+        JSON blob. Returns None if chat doesn't exist or doesn't belong to user.
+        """
+        try:
+            with get_db_context(db) as db:
+                result = (
+                    db.query(Chat.folder_id).filter_by(id=id, user_id=user_id).first()
+                )
+                return result[0] if result else None
+        except Exception:
+            return None
+
     def get_chats(
         self, skip: int = 0, limit: int = 50, db: Optional[Session] = None
     ) -> list[ChatModel]:
@@ -853,14 +1471,18 @@ class ChatTable:
                 if order_by and direction:
                     if hasattr(Chat, order_by):
                         if direction.lower() == "asc":
-                            query = query.order_by(getattr(Chat, order_by).asc())
+                            query = query.order_by(
+                                getattr(Chat, order_by).asc(), Chat.id
+                            )
                         elif direction.lower() == "desc":
-                            query = query.order_by(getattr(Chat, order_by).desc())
+                            query = query.order_by(
+                                getattr(Chat, order_by).desc(), Chat.id
+                            )
                 else:
-                    query = query.order_by(Chat.updated_at.desc())
+                    query = query.order_by(Chat.updated_at.desc(), Chat.id)
 
             else:
-                query = query.order_by(Chat.updated_at.desc())
+                query = query.order_by(Chat.updated_at.desc(), Chat.id)
 
             total = query.count()
 
@@ -880,14 +1502,25 @@ class ChatTable:
 
     def get_pinned_chats_by_user_id(
         self, user_id: str, db: Optional[Session] = None
-    ) -> list[ChatModel]:
+    ) -> list[ChatTitleIdResponse]:
         with get_db_context(db) as db:
             all_chats = (
                 db.query(Chat)
                 .filter_by(user_id=user_id, pinned=True, archived=False)
                 .order_by(Chat.updated_at.desc())
+                .with_entities(Chat.id, Chat.title, Chat.updated_at, Chat.created_at)
             )
-            return [ChatModel.model_validate(chat) for chat in all_chats]
+            return [
+                ChatTitleIdResponse.model_validate(
+                    {
+                        "id": chat[0],
+                        "title": chat[1],
+                        "updated_at": chat[2],
+                        "created_at": chat[3],
+                    }
+                )
+                for chat in all_chats
+            ]
 
     def get_archived_chats_by_user_id(
         self, user_id: str, db: Optional[Session] = None
@@ -991,7 +1624,7 @@ class ChatTable:
             if folder_ids:
                 query = query.filter(Chat.folder_id.in_(folder_ids))
 
-            query = query.order_by(Chat.updated_at.desc())
+            query = query.order_by(Chat.updated_at.desc(), Chat.id)
 
             # Check if the database dialect is either 'sqlite' or 'postgresql'
             dialect_name = db.bind.dialect.name
@@ -1013,29 +1646,23 @@ class ChatTable:
 
                 # Check if there are any tags to filter, it should have all the tags
                 if "none" in tag_ids:
-                    query = query.filter(
-                        text(
-                            """
+                    query = query.filter(text("""
                             NOT EXISTS (
                                 SELECT 1
                                 FROM json_each(Chat.meta, '$.tags') AS tag
                             )
-                            """
-                        )
-                    )
+                            """))
                 elif tag_ids:
                     query = query.filter(
                         and_(
                             *[
-                                text(
-                                    f"""
+                                text(f"""
                                     EXISTS (
                                         SELECT 1
                                         FROM json_each(Chat.meta, '$.tags') AS tag
                                         WHERE tag.value = :tag_id_{tag_idx}
                                     )
-                                    """
-                                ).params(**{f"tag_id_{tag_idx}": tag_id})
+                                    """).params(**{f"tag_id_{tag_idx}": tag_id})
                                 for tag_idx, tag_id in enumerate(tag_ids)
                             ]
                         )
@@ -1071,29 +1698,23 @@ class ChatTable:
 
                 # Check if there are any tags to filter, it should have all the tags
                 if "none" in tag_ids:
-                    query = query.filter(
-                        text(
-                            """
+                    query = query.filter(text("""
                             NOT EXISTS (
                                 SELECT 1
                                 FROM json_array_elements_text(Chat.meta->'tags') AS tag
                             )
-                            """
-                        )
-                    )
+                            """))
                 elif tag_ids:
                     query = query.filter(
                         and_(
                             *[
-                                text(
-                                    f"""
+                                text(f"""
                                     EXISTS (
                                         SELECT 1
                                         FROM json_array_elements_text(Chat.meta->'tags') AS tag
                                         WHERE tag = :tag_id_{tag_idx}
                                     )
-                                    """
-                                ).params(**{f"tag_id_{tag_idx}": tag_id})
+                                    """).params(**{f"tag_id_{tag_idx}": tag_id})
                                 for tag_idx, tag_id in enumerate(tag_ids)
                             ]
                         )
@@ -1124,7 +1745,7 @@ class ChatTable:
             query = query.filter(or_(Chat.pinned == False, Chat.pinned == None))
             query = query.filter_by(archived=False)
 
-            query = query.order_by(Chat.updated_at.desc())
+            query = query.order_by(Chat.updated_at.desc(), Chat.id)
 
             if skip:
                 query = query.offset(skip)
@@ -1169,8 +1790,8 @@ class ChatTable:
     ) -> list[TagModel]:
         with get_db_context(db) as db:
             chat = db.get(Chat, id)
-            tags = chat.meta.get("tags", [])
-            return [Tags.get_tag_by_name_and_user_id(tag, user_id) for tag in tags]
+            tag_ids = chat.meta.get("tags", [])
+            return Tags.get_tags_by_ids_and_user_id(tag_ids, user_id, db=db)
 
     def get_chat_list_by_user_id_and_tag_name(
         self,
@@ -1211,20 +1832,16 @@ class ChatTable:
     def add_chat_tag_by_id_and_user_id_and_tag_name(
         self, id: str, user_id: str, tag_name: str, db: Optional[Session] = None
     ) -> Optional[ChatModel]:
-        tag = Tags.get_tag_by_name_and_user_id(tag_name, user_id)
-        if tag is None:
-            tag = Tags.insert_new_tag(tag_name, user_id)
+        tag_id = tag_name.replace(" ", "_").lower()
+        Tags.ensure_tags_exist([tag_name], user_id, db=db)
         try:
             with get_db_context(db) as db:
                 chat = db.get(Chat, id)
-
-                tag_id = tag.id
                 if tag_id not in chat.meta.get("tags", []):
                     chat.meta = {
                         **chat.meta,
                         "tags": list(set(chat.meta.get("tags", []) + [tag_id])),
                     }
-
                 db.commit()
                 db.refresh(chat)
                 return ChatModel.model_validate(chat)
@@ -1234,40 +1851,53 @@ class ChatTable:
     def count_chats_by_tag_name_and_user_id(
         self, tag_name: str, user_id: str, db: Optional[Session] = None
     ) -> int:
-        with get_db_context(db) as db:  # Assuming `get_db()` returns a session object
+        with get_db_context(db) as db:
             query = db.query(Chat).filter_by(user_id=user_id, archived=False)
-
-            # Normalize the tag_name for consistency
             tag_id = tag_name.replace(" ", "_").lower()
 
             if db.bind.dialect.name == "sqlite":
-                # SQLite JSON1 support for querying the tags inside the `meta` JSON field
                 query = query.filter(
                     text(
-                        f"EXISTS (SELECT 1 FROM json_each(Chat.meta, '$.tags') WHERE json_each.value = :tag_id)"
+                        "EXISTS (SELECT 1 FROM json_each(Chat.meta, '$.tags') WHERE json_each.value = :tag_id)"
                     )
                 ).params(tag_id=tag_id)
-
             elif db.bind.dialect.name == "postgresql":
-                # PostgreSQL JSONB support for querying the tags inside the `meta` JSON field
                 query = query.filter(
                     text(
                         "EXISTS (SELECT 1 FROM json_array_elements_text(Chat.meta->'tags') elem WHERE elem = :tag_id)"
                     )
                 ).params(tag_id=tag_id)
-
             else:
                 raise NotImplementedError(
                     f"Unsupported dialect: {db.bind.dialect.name}"
                 )
 
-            # Get the count of matching records
-            count = query.count()
+            return query.count()
 
-            # Debugging output for inspection
-            log.info(f"Count of chats for tag '{tag_name}': {count}")
+    def delete_orphan_tags_for_user(
+        self,
+        tag_ids: list[str],
+        user_id: str,
+        threshold: int = 0,
+        db: Optional[Session] = None,
+    ) -> None:
+        """Delete tag rows from *tag_ids* that appear in at most *threshold*
+        non-archived chats for *user_id*.  One query to find orphans, one to
+        delete them.
 
-            return count
+        Use threshold=0 after a tag is already removed from a chat's meta.
+        Use threshold=1 when the chat itself is about to be deleted (the
+        referencing chat still exists at query time).
+        """
+        if not tag_ids:
+            return
+        with get_db_context(db) as db:
+            orphans = []
+            for tag_id in tag_ids:
+                count = self.count_chats_by_tag_name_and_user_id(tag_id, user_id, db=db)
+                if count <= threshold:
+                    orphans.append(tag_id)
+            Tags.delete_tags_by_ids_and_user_id(orphans, user_id, db=db)
 
     def count_chats_by_folder_id_and_user_id(
         self, folder_id: str, user_id: str, db: Optional[Session] = None
@@ -1319,6 +1949,7 @@ class ChatTable:
     def delete_chat_by_id(self, id: str, db: Optional[Session] = None) -> bool:
         try:
             with get_db_context(db) as db:
+                db.query(ChatMessage).filter_by(chat_id=id).delete()
                 db.query(Chat).filter_by(id=id).delete()
                 db.commit()
 
@@ -1331,6 +1962,7 @@ class ChatTable:
     ) -> bool:
         try:
             with get_db_context(db) as db:
+                db.query(ChatMessage).filter_by(chat_id=id).delete()
                 db.query(Chat).filter_by(id=id, user_id=user_id).delete()
                 db.commit()
 
@@ -1345,6 +1977,12 @@ class ChatTable:
             with get_db_context(db) as db:
                 self.delete_shared_chats_by_user_id(user_id, db=db)
 
+                chat_id_subquery = (
+                    db.query(Chat.id).filter_by(user_id=user_id).subquery()
+                )
+                db.query(ChatMessage).filter(
+                    ChatMessage.chat_id.in_(chat_id_subquery)
+                ).delete(synchronize_session=False)
                 db.query(Chat).filter_by(user_id=user_id).delete()
                 db.commit()
 
@@ -1357,6 +1995,14 @@ class ChatTable:
     ) -> bool:
         try:
             with get_db_context(db) as db:
+                chat_id_subquery = (
+                    db.query(Chat.id)
+                    .filter_by(user_id=user_id, folder_id=folder_id)
+                    .subquery()
+                )
+                db.query(ChatMessage).filter(
+                    ChatMessage.chat_id.in_(chat_id_subquery)
+                ).delete(synchronize_session=False)
                 db.query(Chat).filter_by(user_id=user_id, folder_id=folder_id).delete()
                 db.commit()
 
@@ -1390,6 +2036,15 @@ class ChatTable:
                 chats_by_user = db.query(Chat).filter_by(user_id=user_id).all()
                 shared_chat_ids = [f"shared-{chat.id}" for chat in chats_by_user]
 
+                # Use subquery to delete chat_messages for shared chats
+                shared_id_subq = (
+                    db.query(Chat.id)
+                    .filter(Chat.user_id.in_(shared_chat_ids))
+                    .subquery()
+                )
+                db.query(ChatMessage).filter(
+                    ChatMessage.chat_id.in_(shared_id_subq)
+                ).delete(synchronize_session=False)
                 db.query(Chat).filter(Chat.user_id.in_(shared_chat_ids)).delete()
                 db.commit()
 

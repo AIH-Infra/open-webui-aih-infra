@@ -195,6 +195,25 @@ class FunctionsTable:
         except Exception:
             return None
 
+    def get_functions_by_ids(
+        self, ids: list[str], db: Optional[Session] = None
+    ) -> list[FunctionModel]:
+        """
+        Batch fetch multiple functions by their IDs in a single query.
+        Returns functions in the same order as the input IDs (None entries filtered out).
+        """
+        if not ids:
+            return []
+        try:
+            with get_db_context(db) as db:
+                functions = db.query(Function).filter(Function.id.in_(ids)).all()
+                # Create a dict for O(1) lookup
+                func_dict = {f.id: FunctionModel.model_validate(f) for f in functions}
+                # Return in original order, filtering out any not found
+                return [func_dict[id] for id in ids if id in func_dict]
+        except Exception:
+            return []
+
     def get_functions(
         self, active_only=False, include_valves=False, db: Optional[Session] = None
     ) -> list[FunctionModel | FunctionWithValvesModel]:
@@ -289,6 +308,28 @@ class FunctionsTable:
                 log.exception(f"Error getting function valves by id {id}: {e}")
                 return None
 
+    def get_function_valves_by_ids(
+        self, ids: list[str], db: Optional[Session] = None
+    ) -> dict[str, dict]:
+        """
+        Batch fetch valves for multiple functions in a single query.
+        Returns a dict mapping function_id -> valves dict.
+        Functions without valves are mapped to {}.
+        """
+        if not ids:
+            return {}
+        try:
+            with get_db_context(db) as db:
+                functions = (
+                    db.query(Function.id, Function.valves)
+                    .filter(Function.id.in_(ids))
+                    .all()
+                )
+                return {f.id: (f.valves if f.valves else {}) for f in functions}
+        except Exception as e:
+            log.exception(f"Error batch-fetching function valves: {e}")
+            return {}
+
     def update_function_valves_by_id(
         self, id: str, valves: dict, db: Optional[Session] = None
     ) -> Optional[FunctionValves]:
@@ -299,7 +340,7 @@ class FunctionsTable:
                 function.updated_at = int(time.time())
                 db.commit()
                 db.refresh(function)
-                return self.get_function_by_id(id, db=db)
+                return FunctionModel.model_validate(function)
             except Exception:
                 return None
 
@@ -319,7 +360,7 @@ class FunctionsTable:
                     function.updated_at = int(time.time())
                     db.commit()
                     db.refresh(function)
-                    return self.get_function_by_id(id, db=db)
+                    return FunctionModel.model_validate(function)
                 else:
                     return None
             except Exception as e:
@@ -381,7 +422,8 @@ class FunctionsTable:
                     }
                 )
                 db.commit()
-                return self.get_function_by_id(id, db=db)
+                function = db.get(Function, id)
+                return FunctionModel.model_validate(function) if function else None
             except Exception:
                 return None
 

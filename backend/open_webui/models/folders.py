@@ -11,7 +11,6 @@ from sqlalchemy.orm import Session
 
 from open_webui.internal.db import Base, JSONField, get_db, get_db_context
 
-
 log = logging.getLogger(__name__)
 
 
@@ -72,6 +71,7 @@ class FolderForm(BaseModel):
     name: str
     data: Optional[dict] = None
     meta: Optional[dict] = None
+    parent_id: Optional[str] = None
     model_config = ConfigDict(extra="allow")
 
 
