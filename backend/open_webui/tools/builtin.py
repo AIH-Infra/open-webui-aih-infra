@@ -10,13 +10,14 @@ import json
 import logging
 import time
 import asyncio
+import hashlib
 from typing import Optional
 
 from fastapi import Request
 
 from open_webui.models.users import UserModel
-from open_webui.routers.retrieval import search_web as _search_web
-from open_webui.retrieval.utils import get_content_from_url
+from open_webui.routers.retrieval import search_web as _search_web, get_rf
+from open_webui.retrieval.utils import get_content_from_url, get_reranking_function
 from open_webui.routers.images import (
     image_generations,
     image_edits,
@@ -36,6 +37,9 @@ from open_webui.models.chats import Chats
 from open_webui.models.channels import Channels, ChannelMember, Channel
 from open_webui.models.messages import Messages, Message
 from open_webui.models.groups import Groups
+from open_webui.models.memories import Memories
+from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+from open_webui.utils.sanitize import sanitize_code
 
 log = logging.getLogger(__name__)
 
@@ -152,8 +156,7 @@ async def search_web(
 ) -> str:
     """
     Search the public web for information. Best for current events, external references,
-    or topics not covered in internal documents. If knowledge base tools are available,
-    consider checking those first for internal information.
+    or topics not covered in internal documents.
 
     :param query: The search query to look up
     :param count: Number of results to return (default: 5)
@@ -166,7 +169,10 @@ async def search_web(
         engine = __request__.app.state.config.WEB_SEARCH_ENGINE
         user = UserModel(**__user__) if __user__ else None
 
-        results = _search_web(__request__, engine, query, user)
+        # Use admin-configured result count if configured, falling back to model-provided count of provided, else default to 5
+        count = __request__.app.state.config.WEB_SEARCH_RESULT_COUNT or count
+
+        results = await asyncio.to_thread(_search_web, __request__, engine, query, user)
 
         # Limit results
         results = results[:count] if results else []
@@ -244,11 +250,13 @@ async def generate_image(
 
         # Persist files to DB if chat context is available
         if __chat_id__ and __message_id__ and images:
-            image_files = Chats.add_message_files_by_id_and_message_id(
+            db_files = Chats.add_message_files_by_id_and_message_id(
                 __chat_id__,
                 __message_id__,
                 image_files,
             )
+            if db_files is not None:
+                image_files = db_files
 
         # Emit the images to the UI if event emitter is available
         if __event_emitter__ and image_files:
@@ -309,11 +317,13 @@ async def edit_image(
 
         # Persist files to DB if chat context is available
         if __chat_id__ and __message_id__ and images:
-            image_files = Chats.add_message_files_by_id_and_message_id(
+            db_files = Chats.add_message_files_by_id_and_message_id(
                 __chat_id__,
                 __message_id__,
                 image_files,
             )
+            if db_files is not None:
+                image_files = db_files
 
         # Emit the images to the UI if event emitter is available
         if __event_emitter__ and image_files:
@@ -338,6 +348,187 @@ async def edit_image(
         return json.dumps({"status": "success", "images": images}, ensure_ascii=False)
     except Exception as e:
         log.exception(f"edit_image error: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# =============================================================================
+# CODE INTERPRETER TOOLS
+# =============================================================================
+
+
+async def execute_code(
+    code: str,
+    __request__: Request = None,
+    __user__: dict = None,
+    __event_emitter__: callable = None,
+    __event_call__: callable = None,
+    __chat_id__: str = None,
+    __message_id__: str = None,
+    __metadata__: dict = None,
+) -> str:
+    """
+    Execute Python code in a sandboxed Jupyter environment.
+
+    ⚠️ For file operations, use open-terminal tools (write_file, read_file, run_command).
+    Files created here are temporary and will be lost.
+
+    This tool is for:
+    - Calculations and data analysis
+    - Visualizations (matplotlib, plotly)
+    - Data processing (pandas, numpy)
+
+    :param code: Python code to execute
+    :return: JSON with stdout, stderr, result
+    """
+    from uuid import uuid4
+
+    if __request__ is None:
+        return json.dumps({"error": "Request context not available"})
+
+    try:
+        # Sanitize code (strips ANSI codes and markdown fences)
+        code = sanitize_code(code)
+
+        # Import blocked modules from config (same as middleware)
+        from open_webui.config import CODE_INTERPRETER_BLOCKED_MODULES
+
+        # Add import blocking code if there are blocked modules
+        if CODE_INTERPRETER_BLOCKED_MODULES:
+            import textwrap
+
+            blocking_code = textwrap.dedent(f"""
+                import builtins
+
+                BLOCKED_MODULES = {CODE_INTERPRETER_BLOCKED_MODULES}
+
+                _real_import = builtins.__import__
+                def restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+                    if name.split('.')[0] in BLOCKED_MODULES:
+                        importer_name = globals.get('__name__') if globals else None
+                        if importer_name == '__main__':
+                            raise ImportError(
+                                f"Direct import of module {{name}} is restricted."
+                            )
+                    return _real_import(name, globals, locals, fromlist, level)
+
+                builtins.__import__ = restricted_import
+                """)
+            code = blocking_code + "\n" + code
+
+        engine = getattr(
+            __request__.app.state.config, "CODE_INTERPRETER_ENGINE", "pyodide"
+        )
+        if engine == "pyodide":
+            # Execute via frontend pyodide using bidirectional event call
+            if __event_call__ is None:
+                return json.dumps(
+                    {
+                        "error": "Event call not available. WebSocket connection required for pyodide execution."
+                    }
+                )
+
+            output = await __event_call__(
+                {
+                    "type": "execute:python",
+                    "data": {
+                        "id": str(uuid4()),
+                        "code": code,
+                        "session_id": (
+                            __metadata__.get("session_id") if __metadata__ else None
+                        ),
+                        "files": (
+                            __metadata__.get("files", []) if __metadata__ else []
+                        ),
+                    },
+                }
+            )
+
+            # Parse the output - pyodide returns dict with stdout, stderr, result
+            if isinstance(output, dict):
+                stdout = output.get("stdout", "")
+                stderr = output.get("stderr", "")
+                result = output.get("result", "")
+            else:
+                stdout = ""
+                stderr = ""
+                result = str(output) if output else ""
+
+        elif engine == "jupyter":
+            from open_webui.utils.code_interpreter import execute_code_jupyter
+
+            output = await execute_code_jupyter(
+                __request__.app.state.config.CODE_INTERPRETER_JUPYTER_URL,
+                code,
+                (
+                    __request__.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_TOKEN
+                    if __request__.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH
+                    == "token"
+                    else None
+                ),
+                (
+                    __request__.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH_PASSWORD
+                    if __request__.app.state.config.CODE_INTERPRETER_JUPYTER_AUTH
+                    == "password"
+                    else None
+                ),
+                __request__.app.state.config.CODE_INTERPRETER_JUPYTER_TIMEOUT,
+            )
+
+            stdout = output.get("stdout", "")
+            stderr = output.get("stderr", "")
+            result = output.get("result", "")
+
+        else:
+            return json.dumps({"error": f"Unknown code interpreter engine: {engine}"})
+
+        # Handle image outputs (base64 encoded) - replace with uploaded URLs
+        # Get actual user object for image upload (upload_image requires user.id attribute)
+        if __user__ and __user__.get("id"):
+            from open_webui.models.users import Users
+            from open_webui.utils.files import get_image_url_from_base64
+
+            user = Users.get_user_by_id(__user__["id"])
+
+            # Extract and upload images from stdout
+            if stdout and isinstance(stdout, str):
+                stdout_lines = stdout.split("\n")
+                for idx, line in enumerate(stdout_lines):
+                    if "data:image/png;base64" in line:
+                        image_url = get_image_url_from_base64(
+                            __request__,
+                            line,
+                            __metadata__ or {},
+                            user,
+                        )
+                        if image_url:
+                            stdout_lines[idx] = f"![Output Image]({image_url})"
+                stdout = "\n".join(stdout_lines)
+
+            # Extract and upload images from result
+            if result and isinstance(result, str):
+                result_lines = result.split("\n")
+                for idx, line in enumerate(result_lines):
+                    if "data:image/png;base64" in line:
+                        image_url = get_image_url_from_base64(
+                            __request__,
+                            line,
+                            __metadata__ or {},
+                            user,
+                        )
+                        if image_url:
+                            result_lines[idx] = f"![Output Image]({image_url})"
+                result = "\n".join(result_lines)
+
+        response = {
+            "status": "success",
+            "stdout": stdout,
+            "stderr": stderr,
+            "result": result,
+        }
+
+        return json.dumps(response, ensure_ascii=False)
+    except Exception as e:
+        log.exception(f"execute_code error: {e}")
         return json.dumps({"error": str(e)})
 
 
@@ -458,6 +649,79 @@ async def replace_memory_content(
         return json.dumps({"error": str(e)})
 
 
+async def delete_memory(
+    memory_id: str,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Delete a memory by its ID.
+
+    :param memory_id: The ID of the memory to delete
+    :return: Confirmation that the memory was deleted
+    """
+    if __request__ is None:
+        return json.dumps({"error": "Request context not available"})
+
+    try:
+        user = UserModel(**__user__) if __user__ else None
+
+        result = Memories.delete_memory_by_id_and_user_id(memory_id, user.id)
+
+        if result:
+            VECTOR_DB_CLIENT.delete(
+                collection_name=f"user-memory-{user.id}", ids=[memory_id]
+            )
+            return json.dumps(
+                {"status": "success", "message": f"Memory {memory_id} deleted"},
+                ensure_ascii=False,
+            )
+        else:
+            return json.dumps({"error": "Memory not found or access denied"})
+    except Exception as e:
+        log.exception(f"delete_memory error: {e}")
+        return json.dumps({"error": str(e)})
+
+
+async def list_memories(
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    List all stored memories for the user.
+
+    :return: JSON list of all memories with id, content, and dates
+    """
+    if __request__ is None:
+        return json.dumps({"error": "Request context not available"})
+
+    try:
+        user = UserModel(**__user__) if __user__ else None
+
+        memories = Memories.get_memories_by_user_id(user.id)
+
+        if memories:
+            result = [
+                {
+                    "id": m.id,
+                    "content": m.content,
+                    "created_at": time.strftime(
+                        "%Y-%m-%d %H:%M", time.localtime(m.created_at)
+                    ),
+                    "updated_at": time.strftime(
+                        "%Y-%m-%d %H:%M", time.localtime(m.updated_at)
+                    ),
+                }
+                for m in memories
+            ]
+            return json.dumps(result, ensure_ascii=False)
+        else:
+            return json.dumps([])
+    except Exception as e:
+        log.exception(f"list_memories error: {e}")
+        return json.dumps({"error": str(e)})
+
+
 # =============================================================================
 # NOTES TOOLS
 # =============================================================================
@@ -556,6 +820,8 @@ async def view_note(
     note_id: str,
     __request__: Request = None,
     __user__: dict = None,
+    __model_knowledge__: Optional[list[dict]] = None,
+    __agent_rag_config__: Optional[dict] = None,
 ) -> str:
     """
     Get the full content of a note by its ID.
@@ -575,14 +841,32 @@ async def view_note(
         if not note:
             return json.dumps({"error": "Note not found"})
 
+        agent_rag_config = _normalize_agent_rag_config(__agent_rag_config__)
+        allow_workspace_notes = agent_rag_config.get("allow_workspace_notes", False)
+        allow_attached_notes = agent_rag_config.get("allow_view_note", False)
+        attached_note_ids = {
+            item.get("id") for item in (__model_knowledge__ or []) if item.get("type") == "note"
+        }
+        is_attached_note = note_id in attached_note_ids
+
+        if is_attached_note:
+            if not allow_attached_notes:
+                return json.dumps({"error": "Access denied"})
+        elif not allow_workspace_notes:
+            return json.dumps({"error": "Access denied"})
+
         # Check access permission
         user_id = __user__.get("id")
         user_group_ids = [group.id for group in Groups.get_groups_by_member_id(user_id)]
 
-        from open_webui.utils.access_control import has_access
+        from open_webui.models.access_grants import AccessGrants
 
-        if note.user_id != user_id and not has_access(
-            user_id, "read", note.access_control, user_group_ids
+        if note.user_id != user_id and not AccessGrants.has_access(
+            user_id=user_id,
+            resource_type="note",
+            resource_id=note.id,
+            permission="read",
+            user_group_ids=set(user_group_ids),
         ):
             return json.dumps({"error": "Access denied"})
 
@@ -633,7 +917,7 @@ async def write_note(
         form = NoteForm(
             title=title,
             data={"content": {"md": content}},
-            access_control={},  # Private by default - only owner can access
+            access_grants=[],  # Private by default - only owner can access
         )
 
         new_note = Notes.insert_new_note(user_id, form)
@@ -688,10 +972,14 @@ async def replace_note_content(
         user_id = __user__.get("id")
         user_group_ids = [group.id for group in Groups.get_groups_by_member_id(user_id)]
 
-        from open_webui.utils.access_control import has_access
+        from open_webui.models.access_grants import AccessGrants
 
-        if note.user_id != user_id and not has_access(
-            user_id, "write", note.access_control, user_group_ids
+        if note.user_id != user_id and not AccessGrants.has_access(
+            user_id=user_id,
+            resource_type="note",
+            resource_id=note.id,
+            permission="write",
+            user_group_ids=set(user_group_ids),
         ):
             return json.dumps({"error": "Write access denied"})
 
@@ -732,6 +1020,7 @@ async def search_chats(
     end_timestamp: Optional[int] = None,
     __request__: Request = None,
     __user__: dict = None,
+    __chat_id__: str = None,
 ) -> str:
     """
     Search the user's previous chat conversations by title and message content.
@@ -761,6 +1050,10 @@ async def search_chats(
 
         results = []
         for chat in chats:
+            # Skip the current chat to avoid showing it in search results
+            if __chat_id__ and chat.id == __chat_id__:
+                continue
+
             # Apply date filters (updated_at is in seconds)
             if start_timestamp and chat.updated_at < start_timestamp:
                 continue
@@ -1343,10 +1636,378 @@ async def search_knowledge_files(
         return json.dumps({"error": str(e)})
 
 
+async def view_file(
+    file_id: str,
+    __request__: Request = None,
+    __user__: dict = None,
+    __model_knowledge__: Optional[list[dict]] = None,
+) -> str:
+    """
+    Get the full content of a file by its ID.
+
+    :param file_id: The ID of the file to retrieve
+    :return: JSON with the file's id, filename, and full text content
+    """
+    if __request__ is None:
+        return json.dumps({"error": "Request context not available"})
+
+    if not __user__:
+        return json.dumps({"error": "User context not available"})
+
+    try:
+        from open_webui.models.files import Files
+        from open_webui.utils.access_control.files import has_access_to_file
+
+        user_id = __user__.get("id")
+        user_role = __user__.get("role", "user")
+
+        file = Files.get_file_by_id(file_id)
+        if not file:
+            return json.dumps({"error": "File not found"})
+
+        if (
+            file.user_id != user_id
+            and user_role != "admin"
+            and not any(
+                item.get("type") == "file" and item.get("id") == file_id
+                for item in (__model_knowledge__ or [])
+            )
+            and not has_access_to_file(
+                file_id=file_id,
+                access_type="read",
+                user=UserModel(**__user__),
+            )
+        ):
+            return json.dumps({"error": "File not found"})
+
+        content = ""
+        if file.data:
+            content = file.data.get("content", "")
+
+        return json.dumps(
+            {
+                "id": file.id,
+                "filename": file.filename,
+                "content": content,
+                "updated_at": file.updated_at,
+                "created_at": file.created_at,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        log.exception(f"view_file error: {e}")
+        return json.dumps({"error": str(e)})
+
+
+def _coerce_positive_int(value, default: int) -> int:
+    try:
+        coerced = int(value)
+        return coerced if coerced > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_positive_float(value, default: float) -> float:
+    try:
+        coerced = float(value)
+        return coerced if coerced > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_agent_rag_config(
+    config: Optional[dict], default_top_k: int = 8
+) -> dict:
+    def coerce_int_range(value, default: int, minimum: int, maximum: int) -> int:
+        try:
+            parsed_value = int(value)
+        except (TypeError, ValueError):
+            parsed_value = default
+
+        return min(max(parsed_value, minimum), maximum)
+
+    if not isinstance(config, dict):
+        return {
+            "scope": "chat",
+            "top_k": default_top_k,
+            "agent_top_k": default_top_k,
+            "candidate_top_k": default_top_k,
+            "k_reranker": min(4, default_top_k),
+            "global_top_k": True,
+            "agent_result_budget": 64,
+            "allow_view_knowledge_file": False,
+            "allow_view_file": False,
+            "allow_view_note": False,
+            "allow_workspace_notes": False,
+            "allow_chat_history": False,
+            "enable_reranking": False,
+        }
+
+    scope = config.get("scope") or "chat"
+    if scope not in {"chat", "global"}:
+        scope = "chat"
+
+    candidate_top_k = _coerce_positive_int(config.get("top_k"), default_top_k)
+    agent_top_k = _coerce_positive_int(config.get("agent_top_k"), candidate_top_k)
+    top_k = candidate_top_k
+    k_reranker = _coerce_positive_int(config.get("k_reranker"), min(4, candidate_top_k))
+    k_reranker = min(k_reranker, candidate_top_k)
+
+    global_top_k = config.get("global_top_k", True)
+    if isinstance(global_top_k, str):
+        global_top_k = global_top_k.lower() not in {"false", "0", "no"}
+    elif global_top_k is None:
+        global_top_k = True
+    else:
+        global_top_k = bool(global_top_k)
+
+    allow_view_file = config.get("allow_view_file", False)
+    if isinstance(allow_view_file, str):
+        allow_view_file = allow_view_file.lower() in {"true", "1", "yes", "on"}
+    elif allow_view_file is None:
+        allow_view_file = False
+    else:
+        allow_view_file = bool(allow_view_file)
+
+    allow_view_knowledge_file = config.get("allow_view_knowledge_file", False)
+    if isinstance(allow_view_knowledge_file, str):
+        allow_view_knowledge_file = allow_view_knowledge_file.lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
+    elif allow_view_knowledge_file is None:
+        allow_view_knowledge_file = False
+    else:
+        allow_view_knowledge_file = bool(allow_view_knowledge_file)
+
+    allow_view_note = config.get("allow_view_note", False)
+    if isinstance(allow_view_note, str):
+        allow_view_note = allow_view_note.lower() in {"true", "1", "yes", "on"}
+    elif allow_view_note is None:
+        allow_view_note = False
+    else:
+        allow_view_note = bool(allow_view_note)
+
+    allow_workspace_notes = config.get("allow_workspace_notes", False)
+    if isinstance(allow_workspace_notes, str):
+        allow_workspace_notes = allow_workspace_notes.lower() in {"true", "1", "yes", "on"}
+    elif allow_workspace_notes is None:
+        allow_workspace_notes = False
+    else:
+        allow_workspace_notes = bool(allow_workspace_notes)
+
+    allow_chat_history = config.get("allow_chat_history", False)
+    if isinstance(allow_chat_history, str):
+        allow_chat_history = allow_chat_history.lower() in {"true", "1", "yes", "on"}
+    elif allow_chat_history is None:
+        allow_chat_history = False
+    else:
+        allow_chat_history = bool(allow_chat_history)
+
+    enable_reranking = config.get("enable_reranking", False)
+    if isinstance(enable_reranking, str):
+        enable_reranking = enable_reranking.lower() in {"true", "1", "yes", "on"}
+    elif enable_reranking is None:
+        enable_reranking = False
+    else:
+        enable_reranking = bool(enable_reranking)
+
+    top_k = candidate_top_k if enable_reranking else agent_top_k
+
+    reranking_model = config.get("reranking_model")
+    if reranking_model == "":
+        reranking_model = None
+
+    agent_result_budget = coerce_int_range(
+        config.get("agent_result_budget"),
+        64,
+        32,
+        256,
+    )
+
+    return {
+        **config,
+        "scope": scope,
+        "top_k": top_k,
+        "agent_top_k": agent_top_k,
+        "candidate_top_k": candidate_top_k,
+        "k_reranker": k_reranker,
+        "global_top_k": global_top_k,
+        "agent_result_budget": agent_result_budget,
+        "allow_view_knowledge_file": allow_view_knowledge_file,
+        "allow_view_file": allow_view_file,
+        "allow_view_note": allow_view_note,
+        "allow_workspace_notes": allow_workspace_notes,
+        "allow_chat_history": allow_chat_history,
+        "enable_reranking": enable_reranking,
+        "reranking_model": reranking_model,
+    }
+
+
+def _build_agent_collection_filter(files: Optional[list[dict]]) -> tuple[Optional[dict], bool]:
+    if files is None:
+        return None, False
+
+    enabled_file_ids = []
+    for file_item in files:
+        if not isinstance(file_item, dict):
+            continue
+
+        file_id = file_item.get("id")
+        if file_id and file_item.get("enabled", True):
+            enabled_file_ids.append(file_id)
+
+    if not enabled_file_ids:
+        return None, True
+
+    return {"file_id": {"$in": enabled_file_ids}}, False
+
+
+def _build_agent_vector_source(
+    *,
+    collection_name: str,
+    source_type: str,
+    filter: Optional[dict] = None,
+    boost: Optional[float] = None,
+) -> dict:
+    return {
+        "collection_name": collection_name,
+        "source_type": source_type,
+        "filter": filter,
+        "boost": _coerce_positive_float(boost, 1.0),
+    }
+
+
+def _get_agent_vector_source_key(source_spec: dict) -> str:
+    return json.dumps(
+        {
+            "collection_name": source_spec["collection_name"],
+            "filter": source_spec.get("filter"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _extract_agent_chunks_from_query_result(
+    query_result: Optional[dict], boost: float = 1.0
+) -> list[dict]:
+    if not query_result or "documents" not in query_result:
+        return []
+
+    documents = query_result.get("documents", [[]])
+    metadatas = query_result.get("metadatas", [[]])
+    distances = query_result.get("distances", [[]])
+
+    documents = documents[0] if documents else []
+    metadatas = metadatas[0] if metadatas else []
+    distances = distances[0] if distances else []
+
+    chunks = []
+    for idx, doc in enumerate(documents):
+        metadata = (
+            metadatas[idx]
+            if idx < len(metadatas) and isinstance(metadatas[idx], dict)
+            else {}
+        )
+        chunk_info = {
+            "content": doc,
+            "source": metadata.get("source", metadata.get("name", "Unknown")),
+            "file_id": metadata.get("file_id", ""),
+            "metadata": metadata,
+        }
+
+        if idx < len(distances):
+            try:
+                # Vector backends normalize this field to a relevance-like score
+                # (higher is better) even though the legacy key is named "distances".
+                distance = float(distances[idx])
+                if boost != 1.0:
+                    distance = distance * boost
+                chunk_info["distance"] = distance
+            except (TypeError, ValueError):
+                pass
+
+        chunks.append(chunk_info)
+
+    return chunks
+
+
+def _dedupe_agent_chunks(chunks: list[dict]) -> list[dict]:
+    deduped_chunks = []
+    chunk_indexes = {}
+
+    for chunk in chunks:
+        content = chunk.get("content")
+        if not isinstance(content, str):
+            deduped_chunks.append(chunk)
+            continue
+
+        chunk_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        existing_index = chunk_indexes.get(chunk_hash)
+
+        if existing_index is None:
+            chunk_indexes[chunk_hash] = len(deduped_chunks)
+            deduped_chunks.append(chunk)
+            continue
+
+        existing_chunk = deduped_chunks[existing_index]
+        current_distance = chunk.get("distance")
+        existing_distance = existing_chunk.get("distance")
+
+        replace_existing = False
+        if current_distance is not None and existing_distance is None:
+            replace_existing = True
+        elif (
+            isinstance(current_distance, (int, float))
+            and isinstance(existing_distance, (int, float))
+            and current_distance > existing_distance
+        ):
+            replace_existing = True
+
+        if replace_existing:
+            deduped_chunks[existing_index] = chunk
+
+    return deduped_chunks
+
+
+def _build_agent_request_reranking_function(
+    request: Request,
+    reranking_model: Optional[str],
+):
+    if request.app.state.config.RAG_RERANKING_ENGINE != "external":
+        return request.app.state.RERANKING_FUNCTION
+
+    if not reranking_model:
+        return request.app.state.RERANKING_FUNCTION
+
+    global_model = request.app.state.config.RAG_RERANKING_MODEL
+    if reranking_model == global_model:
+        return request.app.state.RERANKING_FUNCTION
+
+    rf = get_rf(
+        request.app.state.config.RAG_RERANKING_ENGINE,
+        reranking_model,
+        request.app.state.config.RAG_EXTERNAL_RERANKER_URL,
+        request.app.state.config.RAG_EXTERNAL_RERANKER_API_KEY,
+        request.app.state.config.RAG_EXTERNAL_RERANKER_TIMEOUT,
+    )
+
+    return get_reranking_function(
+        request.app.state.config.RAG_RERANKING_ENGINE,
+        reranking_model,
+        rf,
+    )
+
+
 async def view_knowledge_file(
     file_id: str,
     __request__: Request = None,
     __user__: dict = None,
+    __model_knowledge__: list[dict] = None,
+    __agent_rag_config__: dict = None,
 ) -> str:
     """
     Get the full content of a file from a knowledge base.
@@ -1360,10 +2021,13 @@ async def view_knowledge_file(
     if not __user__:
         return json.dumps({"error": "User context not available"})
 
+    agent_rag_config = _normalize_agent_rag_config(__agent_rag_config__)
+    scope = agent_rag_config["scope"]
+
     try:
         from open_webui.models.files import Files
         from open_webui.models.knowledge import Knowledges
-        from open_webui.utils.access_control import has_access
+        from open_webui.models.access_grants import AccessGrants
 
         user_id = __user__.get("id")
         user_role = __user__.get("role", "user")
@@ -1374,7 +2038,24 @@ async def view_knowledge_file(
             return json.dumps({"error": "File not found"})
 
         # Check access via any KB containing this file
-        knowledges = Knowledges.get_knowledges_by_file_id(file_id)
+        # AIH-Infra: scope control - limit to chat KBs if scope="chat"
+        all_knowledges = Knowledges.get_knowledges_by_file_id(file_id)
+
+        if scope == "chat":
+            if not __model_knowledge__:
+                return json.dumps({"error": "File not found"})
+
+            # Chat scope: only check KBs in current chat
+            chat_kb_ids = [
+                item.get("id")
+                for item in __model_knowledge__
+                if item.get("type") == "collection"
+            ]
+            knowledges = [kb for kb in all_knowledges if kb.id in chat_kb_ids]
+        else:
+            # Global scope: check all KBs
+            knowledges = all_knowledges
+
         has_knowledge_access = False
         knowledge_info = None
 
@@ -1382,8 +2063,12 @@ async def view_knowledge_file(
             if (
                 user_role == "admin"
                 or knowledge_base.user_id == user_id
-                or has_access(
-                    user_id, "read", knowledge_base.access_control, user_group_ids
+                or AccessGrants.has_access(
+                    user_id=user_id,
+                    resource_type="knowledge",
+                    resource_id=knowledge_base.id,
+                    permission="read",
+                    user_group_ids=set(user_group_ids),
                 )
             ):
                 has_knowledge_access = True
@@ -1391,6 +2076,8 @@ async def view_knowledge_file(
                 break
 
         if not has_knowledge_access:
+            if scope == "chat":
+                return json.dumps({"error": "File not found"})
             if file.user_id != user_id and user_role != "admin":
                 return json.dumps({"error": "Access denied"})
 
@@ -1419,23 +2106,18 @@ async def query_knowledge_files(
     query: str,
     knowledge_ids: Optional[list[str]] = None,
     count: int = 5,
-    top_k: Optional[int] = None,
-    relevance_threshold: Optional[float] = None,
     __request__: Request = None,
     __user__: dict = None,
     __model_knowledge__: list[dict] = None,
-    __metadata__: dict = None,
+    __agent_rag_config__: dict = None,
 ) -> str:
     """
-    Search knowledge base files using semantic/vector search. This should be your first
-    choice for finding information before searching the web. Searches across collections (KBs),
+    Search knowledge base files using semantic/vector search. Searches across collections (KBs),
     individual files, and notes that the user has access to.
 
     :param query: The search query to find semantically relevant content
     :param knowledge_ids: Optional list of KB ids to limit search to specific knowledge bases
-    :param count: Maximum number of results to return (default: 5, deprecated - use top_k instead)
-    :param top_k: Maximum number of results to return (overrides count if provided)
-    :param relevance_threshold: Minimum similarity score (0-1) for filtering results
+    :param count: Maximum number of results to return (default: 5)
     :return: JSON with relevant chunks containing content, source filename, and relevance score
     """
     if __request__ is None:
@@ -1444,28 +2126,40 @@ async def query_knowledge_files(
     if not __user__:
         return json.dumps({"error": "User context not available"})
 
-    try:
-        # Log function call parameters
-        log.info(f"[RAG DEBUG] query_knowledge_files called with: query='{query[:50]}...', count={count}, top_k={top_k}, relevance_threshold={relevance_threshold}")
+    count = _coerce_positive_int(count, 5)
+    agent_rag_config = _normalize_agent_rag_config(
+        __agent_rag_config__, default_top_k=count
+    )
+    top_k = agent_rag_config["top_k"]
+    count = top_k
+    scope = agent_rag_config["scope"]
+    global_top_k = agent_rag_config["global_top_k"]
+    enable_reranking = agent_rag_config["enable_reranking"]
 
-        # Extract session-level RAG parameters from metadata if not provided
-        if __metadata__:
-            log.info(f"[RAG DEBUG] Full metadata: {__metadata__}")
-            rag_params = __metadata__.get("params", {}).get("rag", {})
-            log.info(f"[RAG DEBUG] Session-level RAG params from metadata: {rag_params}")
-            if top_k is None and rag_params.get("top_k") is not None:
-                top_k = rag_params.get("top_k")
-                log.info(f"[RAG DEBUG] Using session-level top_k: {top_k}")
-            if relevance_threshold is None and rag_params.get("relevance_threshold") is not None:
-                relevance_threshold = rag_params.get("relevance_threshold")
-                log.info(f"[RAG DEBUG] Using session-level relevance_threshold: {relevance_threshold}")
+    # Debug: Log model_knowledge content
+    log.debug(f"query_knowledge_files: scope={scope}, __model_knowledge__={__model_knowledge__}")
+
+    # Handle knowledge_ids being string "None", "null", or empty
+    if isinstance(knowledge_ids, str):
+        if knowledge_ids.lower() in ("none", "null", ""):
+            knowledge_ids = None
         else:
-            log.info(f"[RAG DEBUG] No metadata available")
+            # Try to parse as JSON array if it looks like one
+            try:
+                knowledge_ids = json.loads(knowledge_ids)
+            except json.JSONDecodeError:
+                # Treat as single ID
+                knowledge_ids = [knowledge_ids]
+
+    try:
         from open_webui.models.knowledge import Knowledges
         from open_webui.models.files import Files
         from open_webui.models.notes import Notes
-        from open_webui.retrieval.utils import query_collection
-        from open_webui.utils.access_control import has_access
+        from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX
+        from open_webui.retrieval.utils import query_doc
+        from open_webui.models.access_grants import AccessGrants
+        from open_webui.utils.rag import resolve_effective_reranking_model
+        from langchain_core.documents import Document
 
         user_id = __user__.get("id")
         user_role = __user__.get("role", "user")
@@ -1475,11 +2169,45 @@ async def query_knowledge_files(
         if not embedding_function:
             return json.dumps({"error": "Embedding function not configured"})
 
-        collection_names = []
+        effective_reranking_model = None
+        reranking_function = None
+        k_reranker = agent_rag_config["k_reranker"]
+        reranking_model = agent_rag_config.get("reranking_model")
+
+        if enable_reranking:
+            effective_reranking_model = resolve_effective_reranking_model(
+                reranking_model,
+                __request__.app.state.config.RAG_RERANKING_MODEL,
+                __request__.app.state.config.RAG_RERANKING_PRESET_MODELS,
+            )
+            if effective_reranking_model:
+                reranking_function = _build_agent_request_reranking_function(
+                    __request__, effective_reranking_model
+                )
+
+        vector_sources = {}
         note_results = []  # Notes aren't vectorized, handle separately
 
-        # If model has attached knowledge, use those
-        if __model_knowledge__:
+        def register_vector_source(source_spec: dict):
+            source_key = _get_agent_vector_source_key(source_spec)
+            existing_source = vector_sources.get(source_key)
+            if existing_source is None:
+                vector_sources[source_key] = source_spec
+                return
+
+            # Keep the strongest boost if the same source/filter combination is
+            # encountered more than once through layered chat/model/folder injection.
+            if source_spec["boost"] > existing_source.get("boost", 1.0):
+                existing_source["boost"] = source_spec["boost"]
+
+        # Chat scope must stay within the injected chat/model/folder knowledge boundary.
+        if scope == "chat":
+            if not __model_knowledge__:
+                log.info(
+                    "query_knowledge_files: chat scope without knowledge boundary; returning empty result"
+                )
+                return json.dumps([], ensure_ascii=False)
+
             for item in __model_knowledge__:
                 item_type = item.get("type")
                 item_id = item.get("id")
@@ -1490,17 +2218,43 @@ async def query_knowledge_files(
                     if knowledge and (
                         user_role == "admin"
                         or knowledge.user_id == user_id
-                        or has_access(
-                            user_id, "read", knowledge.access_control, user_group_ids
+                        or AccessGrants.has_access(
+                            user_id=user_id,
+                            resource_type="knowledge",
+                            resource_id=knowledge.id,
+                            permission="read",
+                            user_group_ids=set(user_group_ids),
                         )
                     ):
-                        collection_names.append(item_id)
+                        file_filter, skip_collection = _build_agent_collection_filter(
+                            item.get("files")
+                        )
+                        if skip_collection:
+                            log.debug(
+                                "query_knowledge_files: collection %s has no enabled files; skipping",
+                                item_id,
+                            )
+                            continue
+
+                        register_vector_source(
+                            _build_agent_vector_source(
+                                collection_name=item_id,
+                                source_type="collection",
+                                filter=file_filter,
+                                boost=item.get("boost"),
+                            )
+                        )
 
                 elif item_type == "file":
                     # Individual file - use file-{id} as collection name
                     file = Files.get_file_by_id(item_id)
-                    if file and (user_role == "admin" or file.user_id == user_id):
-                        collection_names.append(f"file-{item_id}")
+                    if file:
+                        register_vector_source(
+                            _build_agent_vector_source(
+                                collection_name=f"file-{item_id}",
+                                source_type="file",
+                            )
+                        )
 
                 elif item_type == "note":
                     # Note - always return full content as context
@@ -1508,7 +2262,12 @@ async def query_knowledge_files(
                     if note and (
                         user_role == "admin"
                         or note.user_id == user_id
-                        or has_access(user_id, "read", note.access_control)
+                        or AccessGrants.has_access(
+                            user_id=user_id,
+                            resource_type="note",
+                            resource_id=note.id,
+                            permission="read",
+                        )
                     ):
                         content = note.data.get("content", {}).get("md", "")
                         note_results.append(
@@ -1527,13 +2286,22 @@ async def query_knowledge_files(
                 if knowledge and (
                     user_role == "admin"
                     or knowledge.user_id == user_id
-                    or has_access(
-                        user_id, "read", knowledge.access_control, user_group_ids
+                    or AccessGrants.has_access(
+                        user_id=user_id,
+                        resource_type="knowledge",
+                        resource_id=knowledge.id,
+                        permission="read",
+                        user_group_ids=set(user_group_ids),
                     )
                 ):
-                    collection_names.append(knowledge_id)
+                    register_vector_source(
+                        _build_agent_vector_source(
+                            collection_name=knowledge_id,
+                            source_type="collection",
+                        )
+                    )
         else:
-            # No model knowledge and no specific IDs - search all accessible KBs
+            # Global scope without explicit IDs: search all accessible KBs.
             result = Knowledges.search_knowledge_bases(
                 user_id,
                 filter={
@@ -1544,53 +2312,124 @@ async def query_knowledge_files(
                 skip=0,
                 limit=50,
             )
-            collection_names = [knowledge_base.id for knowledge_base in result.items]
+            for knowledge_base in result.items:
+                register_vector_source(
+                    _build_agent_vector_source(
+                        collection_name=knowledge_base.id,
+                        source_type="collection",
+                    )
+                )
+
+        def sort_agent_chunks_by_score(chunk_list: list[dict]) -> list[dict]:
+            chunks_with_distance = [c for c in chunk_list if "distance" in c]
+            chunks_without_distance = [c for c in chunk_list if "distance" not in c]
+
+            if chunks_with_distance:
+                chunks_with_distance.sort(key=lambda x: x["distance"], reverse=True)
+
+            return chunks_with_distance + chunks_without_distance
+
+        async def rerank_agent_chunks(chunk_list: list[dict], limit: int) -> list[dict]:
+            if not reranking_function or not chunk_list:
+                return chunk_list
+
+            rerankable_chunks = [
+                chunk for chunk in chunk_list if isinstance(chunk.get("content"), str)
+            ]
+            non_rerankable_chunks = [
+                chunk for chunk in chunk_list if not isinstance(chunk.get("content"), str)
+            ]
+
+            if not rerankable_chunks:
+                return chunk_list
+
+            scores = await asyncio.to_thread(
+                reranking_function,
+                query,
+                [
+                    Document(
+                        page_content=chunk["content"],
+                        metadata={"chunk": chunk},
+                    )
+                    for chunk in rerankable_chunks
+                ],
+            )
+
+            if scores is None:
+                return chunk_list
+
+            if not isinstance(scores, list):
+                scores = scores.tolist() if hasattr(scores, "tolist") else list(scores)
+
+            reranked_pairs = []
+            for chunk, score in zip(rerankable_chunks, scores):
+                ranked_chunk = chunk.copy()
+                if score is not None:
+                    try:
+                        ranked_chunk["distance"] = float(score)
+                    except (TypeError, ValueError):
+                        pass
+                reranked_pairs.append(ranked_chunk)
+
+            reranked_pairs = sort_agent_chunks_by_score(reranked_pairs)
+            return reranked_pairs[:limit] + non_rerankable_chunks
 
         chunks = []
 
-        # Add note results first
+        # Add note results first. These are direct-content results and should not be
+        # reranked by the vector reranker.
         chunks.extend(note_results)
 
-        # Determine effective top_k value (priority: top_k parameter > count parameter)
-        effective_k = top_k if top_k is not None else count
-        log.info(f"[RAG DEBUG] effective_k={effective_k}, top_k={top_k}, count={count}, relevance_threshold={relevance_threshold}")
-
         # Query vector collections if any
-        if collection_names:
-            query_results = await query_collection(
-                collection_names=collection_names,
-                queries=[query],
-                embedding_function=embedding_function,
-                k=effective_k,
+        vector_source_specs = list(vector_sources.values())
+        if vector_source_specs:
+            query_embeddings = await embedding_function(
+                [query], prefix=RAG_EMBEDDING_QUERY_PREFIX
             )
+            query_embedding = query_embeddings[0] if query_embeddings else None
 
-            if query_results and "documents" in query_results:
-                documents = query_results.get("documents", [[]])[0]
-                metadatas = query_results.get("metadatas", [[]])[0]
-                distances = query_results.get("distances", [[]])[0]
+            if query_embedding is None:
+                return json.dumps({"error": "Failed to generate query embedding"})
 
-                for idx, doc in enumerate(documents):
-                    # Calculate similarity score (distance to similarity: 1 - distance)
-                    similarity_score = 1 - distances[idx] if idx < len(distances) else None
+            vector_chunks = []
+            for source_spec in vector_source_specs:
+                raw_result = query_doc(
+                    collection_name=source_spec["collection_name"],
+                    query_embedding=query_embedding,
+                    k=top_k,
+                    filter=source_spec.get("filter"),
+                )
+                if raw_result is None:
+                    continue
 
-                    # Apply relevance threshold filter if specified
-                    if relevance_threshold is not None and similarity_score is not None:
-                        if similarity_score < relevance_threshold:
-                            continue  # Skip chunks below threshold
+                query_result = (
+                    raw_result.model_dump()
+                    if hasattr(raw_result, "model_dump")
+                    else raw_result
+                )
+                source_chunks = _extract_agent_chunks_from_query_result(
+                    query_result,
+                    boost=source_spec.get("boost", 1.0),
+                )
+                source_chunks = _dedupe_agent_chunks(source_chunks)
+                source_chunks = sort_agent_chunks_by_score(source_chunks)
 
-                    chunk_info = {
-                        "content": doc,
-                        "source": metadatas[idx].get(
-                            "source", metadatas[idx].get("name", "Unknown")
-                        ),
-                        "file_id": metadatas[idx].get("file_id", ""),
-                    }
-                    if idx < len(distances):
-                        chunk_info["distance"] = distances[idx]
-                    chunks.append(chunk_info)
+                if not global_top_k:
+                    source_chunks = source_chunks[:top_k]
+                    source_chunks = await rerank_agent_chunks(source_chunks, k_reranker)
 
-        # Limit to requested count (use effective_k which respects top_k parameter)
-        chunks = chunks[:effective_k]
+                vector_chunks.extend(source_chunks)
+
+            vector_chunks = _dedupe_agent_chunks(vector_chunks)
+
+            if global_top_k:
+                vector_chunks = sort_agent_chunks_by_score(vector_chunks)
+                vector_chunks = vector_chunks[:top_k]
+                vector_chunks = await rerank_agent_chunks(vector_chunks, k_reranker)
+
+            chunks.extend(vector_chunks)
+
+        chunks = sort_agent_chunks_by_score(chunks)
 
         return json.dumps(chunks, ensure_ascii=False)
     except Exception as e:
@@ -1701,4 +2540,66 @@ async def query_knowledge_bases(
 
     except Exception as e:
         log.exception(f"query_knowledge_bases error: {e}")
+        return json.dumps({"error": str(e)})
+
+
+# =============================================================================
+# SKILLS TOOLS
+# =============================================================================
+
+
+async def view_skill(
+    name: str,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Load the full instructions of a skill by its name from the available skills manifest.
+    Use this when you need detailed instructions for a skill listed in <available_skills>.
+
+    :param name: The name of the skill to load (as shown in the manifest)
+    :return: The full skill instructions as markdown content
+    """
+    if __request__ is None:
+        return json.dumps({"error": "Request context not available"})
+
+    if not __user__:
+        return json.dumps({"error": "User context not available"})
+
+    try:
+        from open_webui.models.skills import Skills
+        from open_webui.models.access_grants import AccessGrants
+
+        user_id = __user__.get("id")
+
+        # Direct DB lookup by unique name
+        skill = Skills.get_skill_by_name(name)
+
+        if not skill or not skill.is_active:
+            return json.dumps({"error": f"Skill '{name}' not found"})
+
+        # Check user access
+        user_role = __user__.get("role", "user")
+        if user_role != "admin" and skill.user_id != user_id:
+            user_group_ids = [
+                group.id for group in Groups.get_groups_by_member_id(user_id)
+            ]
+            if not AccessGrants.has_access(
+                user_id=user_id,
+                resource_type="skill",
+                resource_id=skill.id,
+                permission="read",
+                user_group_ids=set(user_group_ids),
+            ):
+                return json.dumps({"error": "Access denied"})
+
+        return json.dumps(
+            {
+                "name": skill.name,
+                "content": skill.content,
+            },
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        log.exception(f"view_skill error: {e}")
         return json.dumps({"error": str(e)})
